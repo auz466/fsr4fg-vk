@@ -1105,7 +1105,14 @@ int main(int argc, char** argv) {
         upload(depth, scene.depth.data(), scene.depth.size() * 4);
         upload(motion, scene.motion.data(), scene.motion.size() * 2);
         logf("=== FRAME %d", frame);
-        const uint64_t id = 100 + frame;
+        // (TRACE_IDS=a,b,c...: the frame IDs to use, frame by frame, to skip or repeat; otherwise 100, 101, ...)
+        uint64_t id = 100 + frame;
+        if (const char* ids = getenv("TRACE_IDS")) {
+            const char* q = ids;
+            for (int k = 0; k < frame && q; k++) q = strchr(q, ','), q = q ? q + 1 : nullptr;
+            if (q) id = strtoull(q, nullptr, 10);
+        }
+        logf("FRAMEID %llu", (unsigned long long)id);
         ffxConfigureDescFrameGeneration cfg{};
         cfg.header.type = FFX_API_CONFIGURE_DESC_TYPE_FRAMEGENERATION;
         cfg.frameGenerationEnabled = true;

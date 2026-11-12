@@ -60,6 +60,12 @@ def cases():
     out['1920x1080_s067_moving_hudless_own_format'] = (1920, 1080, 1286, 724, 4, {'TRACE_CAMERA': '0.5', 'TRACE_HUD': '1',
         'TRACE_COLOR_FORMAT': '44', 'TRACE_HUDLESS_FORMAT': '37'})
     out['1920x1080_s067_moving_distortion'] = (1920, 1080, 1286, 724, 4, {'TRACE_CAMERA': '0.5', 'TRACE_DISTORTION': '2'})
+    # (a partial generation rectangle: letterboxed, and off centre; frame IDs that skip and that repeat)
+    out['1920x1080_s067_moving_rect_letterbox'] = (1920, 1080, 1286, 724, 4, {'TRACE_CAMERA': '0.5', 'TRACE_RECT': '0,135,1920,810'})
+    out['1920x1080_s067_moving_rect_offcentre'] = (1920, 1080, 1286, 724, 4, {'TRACE_CAMERA': '0.5', 'TRACE_RECT': '37,21,1501,901'})
+    out['1920x1080_s067_moving_ids_skip'] = (1920, 1080, 1286, 724, 6, {'TRACE_CAMERA': '0.5', 'TRACE_IDS': '100,101,103,104,107,108'})
+    out['1920x1080_s067_moving_ids_repeat'] = (1920, 1080, 1286, 724, 6, {'TRACE_CAMERA': '0.5', 'TRACE_IDS': '100,101,101,102,103,103'})
+    out['1920x1080_s067_moving_ids_back'] = (1920, 1080, 1286, 724, 5, {'TRACE_CAMERA': '0.5', 'TRACE_IDS': '100,101,102,90,91'})
     # (other fields of view and planes: the camera matrices use tanf and the planes in float)
     for fov, near, far, nm in (('0.7', '0.05', '500', 'fov07_finite'), ('1.3', '0.3', None, 'fov13_infinite'), ('0.42', '1', '20000', 'fov042_finite'),
                                  ('0.42', '1', '20000', 'fov042_std_finite')):
@@ -189,7 +195,7 @@ def main():
     base = '1920x1080_s067_moving'
     groups = [['%dx%d_%s_%s' % (w, h, s, c) for c in ('still', 'moving')] for w, h in ((1280, 720), (1920, 1080), (5120, 2880))
               for s in ('native', 's067')]
-    groups += [[base + '_color_rgba16f_srgb_gain4', base + '_color_rgba16f_scrgb_hdr'], [base, base + '_color_rgba8srgb'],
+    groups += [[base, base + '_rect_letterbox', base + '_rect_offcentre'], [base + '_color_rgba16f_srgb_gain4', base + '_color_rgba16f_scrgb_hdr'], [base, base + '_color_rgba8srgb'],
                [base + '_jitter_nocancel', base + '_jittercancel'], [base, base + '_displaymv'], [base, base + '_reset3'], [base + '_depth_' + m for m in ('std_finite', 'inv_finite', 'std_infinite', 'inv_infinite')]]
     for g in groups:
         if not all(n in todo for n in g): continue

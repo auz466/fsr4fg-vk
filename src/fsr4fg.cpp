@@ -249,6 +249,8 @@ struct Context {
     uint32_t slot = 0;
     bool prepared = false;
     uint64_t prepared_id = 0;
+    uint64_t last_id = 0;
+    bool has_last_id = false;   // (the frame ID of the last generate, for the gaps that reset)
     bool prepare_reset = false;
     uint32_t render_w = 0, render_h = 0;
     Mat4 clip_to_world_prev = identity(), clip_to_world_prev2 = identity();
@@ -933,7 +935,11 @@ ffxReturnCode_t generate(Context& c, const ffxDispatchDescFrameGeneration& d) {
     CsFi fi{};
     fi.renderSize[0] = c.render_w, fi.renderSize[1] = c.render_h;
     fi.displaySize[0] = c.width, fi.displaySize[1] = c.height;
-    fi.reset = (d.reset || c.prepare_reset) ? 1 : 0;
+    // (as AMD's, traced: a frame ID that is neither the last one nor the next resets, as the API documents; a repeated
+    // one does not)
+    const bool gap = c.has_last_id && d.frameID != c.last_id && d.frameID != c.last_id + 1;
+    c.last_id = d.frameID, c.has_last_id = true;
+    fi.reset = (d.reset || c.prepare_reset || gap) ? 1 : 0;
     fi.backBufferTransferFunction = d.backbufferTransferFunction;
     fi.dispatchFlags = c.config_flags & (FFX_FRAMEGENERATION_FLAG_DRAW_DEBUG_TEAR_LINES | FFX_FRAMEGENERATION_FLAG_DRAW_DEBUG_RESET_INDICATORS);
     fi.minMaxLuminance[0] = d.minMaxLuminance[0], fi.minMaxLuminance[1] = d.minMaxLuminance[1];
