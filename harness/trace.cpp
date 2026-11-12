@@ -1002,6 +1002,11 @@ int main(int argc, char** argv) {
     count = std::min<uint64_t>(count, 16);
     qv.versionIds = ids, qv.versionNames = names;
     r = query(nullptr, &qv.header);
+    {   // (for the suite: what is compared with AMD's; the names differ by design)
+        std::string idl;
+        for (uint64_t i = 0; i < count; i++) idl += (i ? "," : "") + std::to_string(ids[i]);
+        logf("=== query versions count=%llu ids=%s -> %u", (unsigned long long)count, idl.c_str(), r);
+    }
     for (uint64_t i = 0; i < count; i++) {
         logf("  version %llu: id=0x%llx name=%s", (unsigned long long)i, (unsigned long long)ids[i], names[i] ? names[i] : "?");
         fprintf(stderr, "provider version: %s (0x%llx)\n", names[i] ? names[i] : "?", (unsigned long long)ids[i]);
@@ -1039,12 +1044,35 @@ int main(int argc, char** argv) {
         hl.hudlessBackBufferFormat = ffxApiGetSurfaceFormatVK(hudless_format);
         cc.header.pNext = &hl.header;
     }
+    auto memory_v2 = [&](uint32_t dispatch_flags) {
+        FfxApiEffectMemoryUsage mu{};
+        ffxQueryDescFrameGenerationGetGPUMemoryUsageV2 q2{};
+        q2.header.type = FFX_API_QUERY_DESC_TYPE_FRAMEGENERATION_GPU_MEMORY_USAGE_V2;
+        q2.device = &dc, q2.maxRenderSize = cc.maxRenderSize, q2.displaySize = cc.displaySize, q2.createFlags = cc.flags;
+        q2.dispatchFlags = dispatch_flags, q2.backBufferFormat = cc.backBufferFormat;
+        q2.hudlessBackBufferFormat = getenv("TRACE_HUDLESS_FORMAT") ? hl.hudlessBackBufferFormat : 0;
+        q2.gpuMemoryUsageFrameGeneration = &mu;
+        const ffxReturnCode_t qr = query(nullptr, &q2.header);
+        logf("=== query memory v2 flags=0x%x dispatch=0x%x total=%llu aliasable=%llu -> %u", cc.flags, dispatch_flags,
+             (unsigned long long)mu.totalUsageInBytes, (unsigned long long)mu.aliasableUsageInBytes, qr);
+    };
+    memory_v2(0), memory_v2(FFX_FRAMEGENERATION_FLAG_DRAW_DEBUG_VIEW);
     ffxContext ctx = nullptr;
     logf("=== create context display=%ux%u render=%ux%u flags=0x%x format=%d", W, Hh, RW, RH, cc.flags, color_format);
     r = create(&ctx, &cc.header, nullptr);
     logf("=== create context -> %u ctx=%p", r, ctx);
     fprintf(stderr, "create context -> %u\n", r);
     if (r != FFX_API_RETURN_OK || !ctx) return 2;
+    auto memory_v1 = [&](const char* when) {
+        FfxApiEffectMemoryUsage mu{};
+        ffxQueryDescFrameGenerationGetGPUMemoryUsage q1{};
+        q1.header.type = FFX_API_QUERY_DESC_TYPE_FRAMEGENERATION_GPU_MEMORY_USAGE;
+        q1.gpuMemoryUsageFrameGeneration = &mu;
+        const ffxReturnCode_t qr = query(&ctx, &q1.header);
+        logf("=== query memory v1 %s total=%llu aliasable=%llu -> %u", when, (unsigned long long)mu.totalUsageInBytes,
+             (unsigned long long)mu.aliasableUsageInBytes, qr);
+    };
+    memory_v1("after create");
     ffxQueryGetProviderVersion pv{};
     pv.header.type = FFX_API_QUERY_DESC_TYPE_GET_PROVIDER_VERSION;
     if (query(&ctx, &pv.header) == FFX_API_RETURN_OK) {
@@ -1192,6 +1220,7 @@ int main(int argc, char** argv) {
             if (getenv("TRACE_DUMP_BUFFERS")) dump_buffers(prefix, (VkDeviceSize)atoll(getenv("TRACE_DUMP_BUFFERS")));
         }
     }
+    memory_v1("after the frames");
     vkDeviceWaitIdle(g_device);
     r = destroy(&ctx, nullptr);
     logf("=== destroy -> %u", r);

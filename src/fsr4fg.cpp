@@ -321,6 +321,49 @@ bool make_image(Context& c, Image& im, VkFormat format, uint32_t w, uint32_t h, 
     im.format = format, im.width = w, im.height = h;
     return true;
 }
+/// What AMD's DLL answers to FFX_API_QUERY_DESC_TYPE_FRAMEGENERATION_GPU_MEMORY_USAGE: the driver's memory requirements
+/// of the resources its context makes (traced: the sum of its allocations at create, but for its constant buffers),
+/// asked of the driver for the same descriptions without allocating. Its resources are not the port's, but the answer
+/// is AMD's: what a caller budgets for. Aliasable: the scratch, the device copy of the weights, the flows, the splats and
+/// three of the third-size images.
+bool amd_memory_usage(Context& c, uint64_t* total, uint64_t* aliasable) {
+    auto image = [&](VkFormat f, uint32_t w, uint32_t h, VkImageUsageFlags usage) -> uint64_t {
+        VkImageCreateInfo ci{VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO};
+        ci.imageType = VK_IMAGE_TYPE_2D, ci.format = f, ci.extent = {w, h, 1}, ci.mipLevels = 1, ci.arrayLayers = 1;
+        ci.samples = VK_SAMPLE_COUNT_1_BIT, ci.tiling = VK_IMAGE_TILING_OPTIMAL, ci.usage = usage;
+        VkImage im;
+        if (c.vk.CreateImage(c.device, &ci, nullptr, &im) != VK_SUCCESS) return 0;
+        VkMemoryRequirements mr;
+        c.vk.GetImageMemoryRequirements(c.device, im, &mr);
+        c.vk.DestroyImage(c.device, im, nullptr);
+        return mr.size;
+    };
+    auto buffer = [&](VkDeviceSize size, VkBufferUsageFlags usage) -> uint64_t {
+        VkBufferCreateInfo bi{VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO};
+        bi.size = size, bi.usage = usage;
+        VkBuffer b;
+        if (c.vk.CreateBuffer(c.device, &bi, nullptr, &b) != VK_SUCCESS) return 0;
+        VkMemoryRequirements mr;
+        c.vk.GetBufferMemoryRequirements(c.device, b, &mr);
+        c.vk.DestroyBuffer(c.device, b, nullptr);
+        return mr.size;
+    };
+    const VkImageUsageFlags all = VK_IMAGE_USAGE_TRANSFER_SRC_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT | VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_STORAGE_BIT;
+    const VkImageUsageFlags small = VK_IMAGE_USAGE_TRANSFER_DST_BIT | VK_IMAGE_USAGE_SAMPLED_BIT;
+    const VkBufferUsageFlags ssbo = VK_BUFFER_USAGE_TRANSFER_SRC_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT | VK_BUFFER_USAGE_STORAGE_BUFFER_BIT;
+    const uint32_t fw = (c.width + 7) / 8, fh = (c.height + 7) / 8;
+    const uint64_t scratch = buffer(c.big ? GEN_SCRATCH_BYTES_8K : GEN_SCRATCH_BYTES_4K, VK_BUFFER_USAGE_TRANSFER_SRC_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT | VK_BUFFER_USAGE_STORAGE_BUFFER_BIT);
+    const uint64_t weights = buffer(GEN_WEIGHTS_SIZE, ssbo | VK_BUFFER_USAGE_UNIFORM_BUFFER_BIT);
+    const uint64_t flow = image(VK_FORMAT_R16G16_SFLOAT, fw, fh, all);
+    const uint64_t third2 = image(VK_FORMAT_R16G16_SFLOAT, c.third_w, c.third_h, all), third1 = image(VK_FORMAT_R32_SFLOAT, c.third_w, c.third_h, all);
+    const uint64_t splat = image(VK_FORMAT_R32G32_UINT, c.third_w, c.third_h, all);
+    const uint64_t history = image(c.history_format, c.width, c.height, all);
+    const uint64_t one = image(VK_FORMAT_R8G8_UNORM, 1, 1, small) + image(VK_FORMAT_R8G8B8A8_UNORM, 1, 1, small);
+    if (!scratch || !weights || !flow || !third2 || !third1 || !splat || !history || !one) return false;
+    *total = scratch + 2 * weights + 2 * flow + 3 * third2 + 2 * third1 + 4 * splat + history + one;
+    *aliasable = scratch + weights + 2 * flow + 3 * third2 + 4 * splat;
+    return true;
+}
 void drop_image(Context& c, Image& im) {
     if (im.view) c.vk.DestroyImageView(c.device, im.view, nullptr);
     if (im.view64) c.vk.DestroyImageView(c.device, im.view64, nullptr);
@@ -1068,10 +1111,10 @@ FFX_API_ENTRY ffxReturnCode_t ffxQuery(ffxContext* context, ffxQueryDescHeader* 
     case FFX_API_QUERY_DESC_TYPE_FRAMEGENERATION_GPU_MEMORY_USAGE: {
         auto* q = (ffxQueryDescFrameGenerationGetGPUMemoryUsage*)desc;
         if (!context || !*context || !q->gpuMemoryUsageFrameGeneration) return FFX_API_RETURN_ERROR_PARAMETER;
-        const Context& c = *(const Context*)*context;
-        q->gpuMemoryUsageFrameGeneration->totalUsageInBytes =
-            c.scratch.size + c.weights.size + (uint64_t)c.width * c.height * 8 + (uint64_t)c.third_w * c.third_h * 44;
-        q->gpuMemoryUsageFrameGeneration->aliasableUsageInBytes = c.scratch.size;
+        Context& c = *(Context*)*context;
+        uint64_t total, aliasable;
+        if (!amd_memory_usage(c, &total, &aliasable)) return FFX_API_RETURN_ERROR_RUNTIME_ERROR;
+        q->gpuMemoryUsageFrameGeneration->totalUsageInBytes = total, q->gpuMemoryUsageFrameGeneration->aliasableUsageInBytes = aliasable;
         return FFX_API_RETURN_OK;
     }
     case FFX_API_QUERY_DESC_TYPE_FRAMEGENERATION_GPU_MEMORY_USAGE_V2: {
