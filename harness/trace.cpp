@@ -805,6 +805,39 @@ struct Scene {
     }
 };
 
+/// The scene's 8-bit RGBA in the back buffer's format: 8-bit formats as they are (BGRA swapped), 10-bit as v * 1023 / 255
+/// (integer, exact), 16-bit float as v / 255 * TRACE_COLOR_GAIN (default 1; above 1 makes values past 1.0, for scRGB).
+static std::vector<uint8_t> in_format(const std::vector<uint8_t>& rgba, VkFormat f) {
+    const size_t n = rgba.size() / 4;
+    std::vector<uint8_t> out;
+    switch (f) {
+    case VK_FORMAT_B8G8R8A8_UNORM: case VK_FORMAT_B8G8R8A8_SRGB:
+        out = rgba;
+        for (size_t i = 0; i < n; i++) std::swap(out[i * 4], out[i * 4 + 2]);
+        return out;
+    case VK_FORMAT_A2B10G10R10_UNORM_PACK32: {
+        out.resize(n * 4);
+        for (size_t i = 0; i < n; i++) {
+            const uint32_t r = rgba[i * 4] * 1023u / 255u, g = rgba[i * 4 + 1] * 1023u / 255u, b = rgba[i * 4 + 2] * 1023u / 255u;
+            const uint32_t v = r | g << 10 | b << 20 | 3u << 30;
+            memcpy(&out[i * 4], &v, 4);
+        }
+        return out;
+    }
+    case VK_FORMAT_R16G16B16A16_SFLOAT: {
+        const float gain = getenv("TRACE_COLOR_GAIN") ? (float)atof(getenv("TRACE_COLOR_GAIN")) : 1.0f;
+        out.resize(n * 8);
+        for (size_t i = 0; i < n; i++)
+            for (int c = 0; c < 4; c++) {
+                const uint16_t h = half(c == 3 ? 1.0f : rgba[i * 4 + c] / 255.0f * gain);
+                memcpy(&out[i * 8 + c * 2], &h, 2);
+            }
+        return out;
+    }
+    default: return rgba;   // (8-bit RGBA, UNORM or SRGB)
+    }
+}
+
 static void message(uint32_t type, const wchar_t* m) {
     std::string s;
     for (; m && *m; m++) s += (char)*m;
@@ -1012,7 +1045,8 @@ int main(int argc, char** argv) {
                 cam_near, cam_far, getenv("TRACE_FOV") ? (float)atof(getenv("TRACE_FOV")) : 1.0f, MW, MH};
     for (int frame = 0; frame < frames; frame++) {
         scene.make(frame);
-        upload(color, scene.color.data(), scene.color.size());
+        const std::vector<uint8_t> texels = in_format(scene.color, color_format);
+        upload(color, texels.data(), texels.size());
         upload(depth, scene.depth.data(), scene.depth.size() * 4);
         upload(motion, scene.motion.data(), scene.motion.size() * 2);
         logf("=== FRAME %d", frame);

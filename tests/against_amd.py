@@ -42,6 +42,19 @@ def cases():
     out['1920x1080_s067_moving_displaymv'] = (1920, 1080, 1286, 724, 4, {'TRACE_CAMERA': '0.5', 'TRACE_CREATE_FLAGS': str(INVERTED | INFINITE | 2)})
     out['1920x1080_s067_moving_displaymv_jittercancel'] = (1920, 1080, 1286, 724, 4, {'TRACE_CAMERA': '0.5', 'TRACE_JITTER': '0.3,-0.2',
         'TRACE_CREATE_FLAGS': str(INVERTED | INFINITE | 2 | 4)})
+    # (colour: back-buffer formats, transfer functions, the HDR flag)
+    HDR = 1 << 5
+    for fmt, transfer, flags, extra, nm in ((43, 0, 0, {}, 'rgba8srgb'), (44, 0, 0, {}, 'bgra8'), (50, 0, 0, {}, 'bgra8srgb'),
+                                            (64, 0, 0, {}, 'a2b10g10r10_srgb'), (64, 1, HDR, {'TRACE_MINMAX': '0.001,1000'}, 'a2b10g10r10_pq_hdr'),
+                                            (97, 2, HDR, {'TRACE_MINMAX': '0.001,1000', 'TRACE_COLOR_GAIN': '4'}, 'rgba16f_scrgb_hdr'),
+                                            (97, 0, 0, {}, 'rgba16f_srgb'), (37, 0, HDR, {}, 'rgba8_hdrflag'),
+                                            (64, 1, HDR, {'TRACE_MINMAX': '0.01,4000'}, 'a2b10g10r10_pq_hdr_4000'),
+                                            (97, 0, 0, {'TRACE_COLOR_GAIN': '4'}, 'rgba16f_srgb_gain4'),
+                                            (97, 2, HDR, {'TRACE_MINMAX': '0.01,4000', 'TRACE_COLOR_GAIN': '4'}, 'rgba16f_scrgb_hdr_4000')):
+        env = {'TRACE_CAMERA': '0.5', 'TRACE_COLOR_FORMAT': str(fmt), 'TRACE_TRANSFER': str(transfer),
+               'TRACE_CREATE_FLAGS': str(INVERTED | INFINITE | flags)}
+        env.update(extra)
+        out['1920x1080_s067_moving_color_' + nm] = (1920, 1080, 1286, 724, 4, env)
     # (other fields of view and planes: the camera matrices use tanf and the planes in float)
     for fov, near, far, nm in (('0.7', '0.05', '500', 'fov07_finite'), ('1.3', '0.3', None, 'fov13_infinite'), ('0.42', '1', '20000', 'fov042_finite'),
                                  ('0.42', '1', '20000', 'fov042_std_finite')):
@@ -163,7 +176,8 @@ def main():
     base = '1920x1080_s067_moving'
     groups = [['%dx%d_%s_%s' % (w, h, s, c) for c in ('still', 'moving')] for w, h in ((1280, 720), (1920, 1080), (5120, 2880))
               for s in ('native', 's067')]
-    groups += [[base + '_jitter_nocancel', base + '_jittercancel'], [base, base + '_displaymv'], [base, base + '_reset3'], [base + '_depth_' + m for m in ('std_finite', 'inv_finite', 'std_infinite', 'inv_infinite')]]
+    groups += [[base + '_color_rgba16f_srgb_gain4', base + '_color_rgba16f_scrgb_hdr'], [base, base + '_color_rgba8srgb'],
+               [base + '_jitter_nocancel', base + '_jittercancel'], [base, base + '_displaymv'], [base, base + '_reset3'], [base + '_depth_' + m for m in ('std_finite', 'inv_finite', 'std_infinite', 'inv_infinite')]]
     for g in groups:
         if not all(n in todo for n in g): continue
         frames = [made(n) for n in g]
