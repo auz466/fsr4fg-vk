@@ -1,0 +1,13 @@
+# build output, and everything extracted from AMD's DLL (build/gen/)
+/build/
+# traces of AMD's DLL and the port, kept locally only
+/re/
+# AMD's DLL and the Windows harness, never committed
+/harness/*.dll
+/harness/*.exe
+/harness/trace2.exe
+*.dll
+# local settings for the harness (harness/run_amd.sh)
+/local.env
+__pycache__/
+*.pyc
