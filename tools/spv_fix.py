@@ -127,10 +127,38 @@ def string_of(ws):
     return b[:b.index(b'\0')].decode()
 
 
+def four_component_writes(m):
+    """AMD's watermark pass writes (1,1,1) and (0,0,0) as 3-component texels into the caller's 4-channel output, which
+    leaves alpha undefined in Vulkan. RADV writes alpha as the other components (traced: (1,1,1,1) and (0,0,0,0)); the
+    port's copy writes those 4-component values, the same bits, defined. Only constant texels with equal components."""
+    comps = {x.w[1]: x for x in m.ins if x.op == 44}                       # OpConstantComposite
+    vecs = {x.w[0]: (x.w[1], x.w[2]) for x in m.ins if x.op == 23}         # OpTypeVector: id -> (component, count)
+    writes = [x for x in m.ins if x.op == 99 and x.w[2] in comps and vecs.get(comps[x.w[2]].w[0], (0, 0))[1] == 3]
+    if not writes: return False
+    comp = vecs[comps[writes[0].w[2]].w[0]][0]
+    v4 = next((t for t, (c, n) in vecs.items() if c == comp and n == 4), None)
+    added = []
+    if v4 is None:
+        v4 = m.new_id(); added.append(Ins(23, [v4, comp, 4]))
+    made = {}
+    for x in writes:
+        c3 = comps[x.w[2]]
+        if len(set(c3.w[2:])) != 1: raise ValueError('a 3-component texel with different components')
+        if c3.w[1] not in made:
+            made[c3.w[1]] = m.new_id(); added.append(Ins(44, [v4, made[c3.w[1]]] + [c3.w[2]] * 4))
+        x.w[2] = made[c3.w[1]]
+    f = m.first_function()
+    m.ins[f:f] = added
+    return True
+
+
 def for_port(blob):
-    """The port's copy of a shader: fix(), and what the spec needs beyond it (output_without_format)."""
+    """The port's copy of a shader: fix(), and what the spec needs beyond it (output_without_format,
+    four_component_writes)."""
     m = Module(fix(blob))
-    return m.blob() if output_without_format(m) else fix(blob)
+    changed = output_without_format(m)
+    changed = four_component_writes(m) or changed
+    return m.blob() if changed else fix(blob)
 
 
 def fix(blob):
