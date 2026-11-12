@@ -95,6 +95,7 @@ struct Image {
     VkImage image = VK_NULL_HANDLE;
     VkDeviceMemory memory = VK_NULL_HANDLE;
     VkImageView view = VK_NULL_HANDLE;
+    VkImageView view64 = VK_NULL_HANDLE;   // (the splat images: the R64_UINT view their writer's atomics need)
     VkFormat format = VK_FORMAT_UNDEFINED;
     uint32_t width = 0, height = 0;
 };
@@ -274,9 +275,13 @@ void drop_buffer(Context& c, Buffer& b) {
     if (b.memory) c.vk.FreeMemory(c.device, b.memory, nullptr);
     b = Buffer{};
 }
-bool make_image(Context& c, Image& im, VkFormat format, uint32_t w, uint32_t h) {
+/// A device-local image with a view of `format`. With splat, the image is R64_UINT and mutable, `format` is the
+/// readers' R32G32_UINT view and view64 the writer's: AMD's DLL makes it R32G32_UINT and runs the 64-bit atomics on
+/// that, which the spec does not allow (no STORAGE_IMAGE_ATOMIC on R32G32_UINT). The bits are the same either way.
+bool make_image(Context& c, Image& im, VkFormat format, uint32_t w, uint32_t h, bool splat = false) {
     VkImageCreateInfo ci{VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO};
-    ci.imageType = VK_IMAGE_TYPE_2D, ci.format = format, ci.extent = {w, h, 1}, ci.mipLevels = 1, ci.arrayLayers = 1;
+    if (splat) ci.flags = VK_IMAGE_CREATE_MUTABLE_FORMAT_BIT | VK_IMAGE_CREATE_EXTENDED_USAGE_BIT;   // (R64_UINT cannot be sampled)
+    ci.imageType = VK_IMAGE_TYPE_2D, ci.format = splat ? VK_FORMAT_R64_UINT : format, ci.extent = {w, h, 1}, ci.mipLevels = 1, ci.arrayLayers = 1;
     ci.samples = VK_SAMPLE_COUNT_1_BIT, ci.tiling = VK_IMAGE_TILING_OPTIMAL;
     ci.usage = VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_STORAGE_BIT | VK_IMAGE_USAGE_TRANSFER_SRC_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT;
     ci.initialLayout = VK_IMAGE_LAYOUT_UNDEFINED;
@@ -291,11 +296,16 @@ bool make_image(Context& c, Image& im, VkFormat format, uint32_t w, uint32_t h) 
     vi.image = im.image, vi.viewType = VK_IMAGE_VIEW_TYPE_2D, vi.format = format;
     vi.subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1};
     if (c.vk.CreateImageView(c.device, &vi, nullptr, &im.view) != VK_SUCCESS) return false;
+    VkImageViewUsageCreateInfo storage_only{VK_STRUCTURE_TYPE_IMAGE_VIEW_USAGE_CREATE_INFO};
+    storage_only.usage = VK_IMAGE_USAGE_STORAGE_BIT;
+    vi.format = VK_FORMAT_R64_UINT, vi.pNext = &storage_only;
+    if (splat && c.vk.CreateImageView(c.device, &vi, nullptr, &im.view64) != VK_SUCCESS) return false;
     im.format = format, im.width = w, im.height = h;
     return true;
 }
 void drop_image(Context& c, Image& im) {
     if (im.view) c.vk.DestroyImageView(c.device, im.view, nullptr);
+    if (im.view64) c.vk.DestroyImageView(c.device, im.view64, nullptr);
     if (im.image) c.vk.DestroyImage(c.device, im.image, nullptr);
     if (im.memory) c.vk.FreeMemory(c.device, im.memory, nullptr);
     im = Image{};
@@ -457,7 +467,7 @@ void write_set(Context& c, const Pass& p, VkDescriptorSet set, const External& e
         default: break;
         }
         if (b.kind == KIND_SAMPLED || b.kind == KIND_STORAGE) {
-            images[n].imageView = im ? im->view : view;
+            images[n].imageView = im ? (b.res == RES_SPLAT_OUT && im->view64 ? im->view64 : im->view) : view;
             images[n].imageLayout = VK_IMAGE_LAYOUT_GENERAL;
         }
         if (b.kind == KIND_UBO || b.kind == KIND_SSBO) w.pBufferInfo = &buffers[n];
@@ -669,7 +679,8 @@ ffxReturnCode_t create(ffxContext* out, ffxCreateContextDescHeader* header) {
     ok = ok && make_image(*c, c->dilated_mv, VK_FORMAT_R16G16_SFLOAT, c->third_w, c->third_h) && make_image(*c, c->prev_mv, VK_FORMAT_R16G16_SFLOAT, c->third_w, c->third_h);
     ok = ok && make_image(*c, c->dilated_depth, VK_FORMAT_R32_SFLOAT, c->third_w, c->third_h) && make_image(*c, c->prev_depth, VK_FORMAT_R32_SFLOAT, c->third_w, c->third_h);
     // (the splats are 64-bit texels to their shader and two 32-bit ones to the passes that read them, as AMD makes them)
-    ok = ok && make_image(*c, c->splat_cur, VK_FORMAT_R32G32_UINT, c->third_w, c->third_h) && make_image(*c, c->splat_fwd, VK_FORMAT_R32G32_UINT, c->third_w, c->third_h);
+    ok = ok && make_image(*c, c->splat_cur, VK_FORMAT_R32G32_UINT, c->third_w, c->third_h, true) &&
+              make_image(*c, c->splat_fwd, VK_FORMAT_R32G32_UINT, c->third_w, c->third_h, true);
     ok = ok && make_image(*c, c->fwd_mv, VK_FORMAT_R16G16_SFLOAT, c->third_w, c->third_h);
     ok = ok && make_image(*c, c->prev_color, c->color_format, c->width, c->height);
     ok = ok && make_image(*c, c->distortion, VK_FORMAT_R8G8_UNORM, 1, 1) && make_image(*c, c->hudless, VK_FORMAT_R8G8B8A8_UNORM, 1, 1);

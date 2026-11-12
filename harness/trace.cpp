@@ -17,9 +17,11 @@
 #include <vector>
 
 #ifdef _WIN32
+#include <direct.h>
 #include <windows.h>
 #else
 #include <dlfcn.h>
+#include <sys/stat.h>
 #endif
 
 // AMD's headers mark the entry points dllexport; here they are only called through pointers.
@@ -668,15 +670,60 @@ static uint16_t half(float f) {
     if (exp >= 31) return (uint16_t)(sign | 0x7c00);
     return (uint16_t)(sign | (exp << 10) | ((man + 0x1000) >> 13));
 }
+/// sin and cos from + - * / and floor only, so the mingw and glibc builds draw the same pictures and send the same camera
+/// (their libm sin() differs in the last bit for some inputs). Accuracy is beside the point; determinism is the point.
+static double det_sin(double x) {
+    const double two_pi = 6.283185307179586, pi = 3.141592653589793;
+    x -= two_pi * std::floor(x / two_pi + 0.5);   // [-pi, pi]
+    if (x > pi * 0.5) x = pi - x;
+    if (x < -pi * 0.5) x = -pi - x;               // [-pi/2, pi/2]
+    const double x2 = x * x;   // (Taylor to x^15: under 1e-10 off on this range)
+    double p = -1.0 / 1307674368000.0;
+    p = p * x2 + 1.0 / 6227020800.0;
+    p = p * x2 - 1.0 / 39916800.0;
+    p = p * x2 + 1.0 / 362880.0;
+    p = p * x2 - 1.0 / 5040.0;
+    p = p * x2 + 1.0 / 120.0;
+    p = p * x2 - 1.0 / 6.0;
+    p = p * x2 + 1.0;
+    return x * p;
+}
+static float dsin(float x) { return (float)det_sin(x); }
+static float dcos(float x) { return (float)det_sin((double)x + 1.5707963267948966); }
 static uint32_t hash2(int x, int y) {
     uint32_t h = (uint32_t)x * 374761393u + (uint32_t)y * 668265263u;
     h = (h ^ (h >> 13)) * 1274126177u;
     return h ^ (h >> 16);
 }
-/// A background that scrolls and a nearer square that moves the other way, with the depth and motion that go with them.
+/// The camera of a frame: still, or (TRACE_CAMERA=k) moving and turning a little more each frame, k times as fast
+struct Cam { float pos[3], right[3], up[3], fwd[3]; };
+static Cam camera_at(int frame) {
+    const float t = getenv("TRACE_CAMERA") ? (float)frame * (float)atof(getenv("TRACE_CAMERA")) : 0.0f;
+    const float yaw = 0.07f * t + 0.013f * t * t, pitch = 0.03f * t;
+    Cam c;
+    const float f[3] = {dsin(yaw) * dcos(pitch), dsin(pitch), dcos(yaw) * dcos(pitch)};
+    const float rgt[3] = {dcos(yaw), 0.0f, -dsin(yaw)};
+    const float up[3] = {f[1] * rgt[2] - f[2] * rgt[1], f[2] * rgt[0] - f[0] * rgt[2], f[0] * rgt[1] - f[1] * rgt[0]};
+    const float pos[3] = {0.31f * t, 0.11f * t * t, -0.23f * t};
+    for (int i = 0; i < 3; i++) c.pos[i] = pos[i], c.right[i] = rgt[i], c.up[i] = up[i], c.fwd[i] = f[i];
+    return c;
+}
+static double dot3(const double* a, const float* b) { return a[0] * b[0] + a[1] * b[1] + a[2] * b[2]; }
+
+/// A background wall seen through the camera (its motion is the camera's, so AMD's forward motion pass takes its
+/// camera path there) and a nearer square that moves across the screen on its own (so it takes the splatted flow)., with the depth and motion that go with them.
 /// Motion is in pixels at render size, pointing from this frame's pixel to where it was (FSR's convention).
+/// The camera: x right, y up, looking along +z, vertical field of view fov, aspect of the render size.
 struct Scene {
     uint32_t w, h, rw, rh;
+    bool inverted, infinite;   // (the depth convention of the create flags)
+    float near_, far_, fov;
+    static constexpr double WALL_Z = 20.0;   // (the wall: the plane z = 20)
+    /// depth at a view distance d, by the create flags' convention
+    float depth_at(float d) const {
+        const double n = near_, f = far_, z = infinite ? 1.0 - n / d : f * (d - n) / (d * (f - n));
+        return (float)(inverted ? 1.0 - z : z);
+    }
     std::vector<uint8_t> color;
     std::vector<float> depth;
     std::vector<uint16_t> motion;
@@ -685,17 +732,36 @@ struct Scene {
         const uint32_t hsh = hash2(cx, cy);
         const float fx = x / 48.0f - cx, fy = y / 48.0f - cy;
         const float edge = (fx < 0.06f || fy < 0.06f) ? 0.35f : 1.0f;
-        const float stripe = 0.75f + 0.25f * std::sin((x + y) * 0.21f);
+        const float stripe = 0.75f + 0.25f * dsin((x + y) * 0.21f);
         out[0] = (uint8_t)(edge * stripe * (60 + (hsh & 0x7f)));
         out[1] = (uint8_t)(edge * stripe * (60 + ((hsh >> 8) & 0x7f)));
         out[2] = (uint8_t)(edge * stripe * (60 + ((hsh >> 16) & 0x7f)));
         out[3] = 255;
     }
+    /// where the ray through (u, v) of camera c meets the wall: the point, and its distance along c's forward
+    void wall(const Cam& c, double u, double v, double aspect, double* p, double* dist) const {
+        const double th = det_sin(fov * 0.5) / det_sin(fov * 0.5 + 1.5707963267948966);
+        const double nx = (2.0 * u - 1.0) * th * aspect, ny = (1.0 - 2.0 * v) * th;
+        double d[3];
+        for (int i = 0; i < 3; i++) d[i] = c.fwd[i] + c.right[i] * nx + c.up[i] * ny;
+        const double t = (WALL_Z - c.pos[2]) / d[2];   // (d . fwd = 1, so t is also the view depth)
+        for (int i = 0; i < 3; i++) p[i] = c.pos[i] + t * d[i];
+        *dist = t;
+    }
+    /// where world point p is in camera c's picture, as (u, v)
+    void project(const Cam& c, const double* p, double aspect, double* u, double* v) const {
+        const double th = det_sin(fov * 0.5) / det_sin(fov * 0.5 + 1.5707963267948966);
+        const double q[3] = {p[0] - c.pos[0], p[1] - c.pos[1], p[2] - c.pos[2]};
+        const double z = dot3(q, c.fwd);
+        *u = (dot3(q, c.right) / (z * th * aspect) + 1.0) * 0.5;
+        *v = (1.0 - dot3(q, c.up) / (z * th)) * 0.5;
+    }
     void make(int frame) {
         color.resize((size_t)w * h * 4), depth.resize((size_t)rw * rh), motion.resize((size_t)rw * rh * 2);
-        // (fractions of the picture a frame, so the same scene at any size)
-        const float bgx = 0.011f * frame, bgy = 0.004f * frame, bgvx = 0.011f, bgvy = 0.004f;
+        const Cam cam = camera_at(frame), prev = camera_at(frame > 0 ? frame - 1 : 0);
+        // (the square: fractions of the picture a frame, so the same scene at any size)
         const float sqx = 0.70f - 0.017f * frame, sqy = 0.35f + 0.006f * frame, sqvx = -0.017f, sqvy = 0.006f, sqr = 0.11f;
+        const double aspect = (double)rw / rh;
         for (uint32_t y = 0; y < h; y++)
             for (uint32_t x = 0; x < w; x++) {
                 const float u = (x + 0.5f) / w, v = (y + 0.5f) / h;
@@ -704,16 +770,28 @@ struct Scene {
                     const float lu = (u - sqx) * w / h, lv = v - sqy;
                     const bool check = (((int)std::floor(lu * 40) + (int)std::floor(lv * 40)) & 1) != 0;
                     px[0] = check ? 230 : 40, px[1] = check ? 200 : 90, px[2] = check ? 40 : 200, px[3] = 255;
-                } else background((u - bgx) * 1920.0f, (v - bgy) * 1080.0f, px);
+                } else {
+                    double p[3], dist;
+                    wall(cam, u, v, aspect, p, &dist);
+                    background((float)(p[0] * 50.0), (float)(-p[1] * 50.0), px);   // (about a cell of 48 pixels per unit)
+                }
             }
         for (uint32_t y = 0; y < rh; y++)
             for (uint32_t x = 0; x < rw; x++) {
                 const float u = (x + 0.5f) / rw, v = (y + 0.5f) / rh;
                 const bool sq = std::fabs(u - sqx) < sqr * rh / rw && std::fabs(v - sqy) < sqr;
-                // reversed depth with an infinite far plane: near / distance
-                depth[(size_t)y * rw + x] = sq ? 0.1f / 2.0f : 0.1f / 20.0f;
-                motion[((size_t)y * rw + x) * 2 + 0] = half(-(sq ? sqvx : bgvx) * rw);
-                motion[((size_t)y * rw + x) * 2 + 1] = half(-(sq ? sqvy : bgvy) * rh);
+                float mx, my, d;
+                if (sq) {
+                    d = 2.0f, mx = -sqvx * rw, my = -sqvy * rh;   // (the square 2 units away)
+                } else {
+                    double p[3], dist, pu, pv;
+                    wall(cam, u, v, aspect, p, &dist);
+                    project(prev, p, aspect, &pu, &pv);
+                    d = (float)dist, mx = (float)((pu - u) * rw), my = (float)((pv - v) * rh);
+                }
+                depth[(size_t)y * rw + x] = depth_at(d);
+                motion[((size_t)y * rw + x) * 2 + 0] = half(mx);
+                motion[((size_t)y * rw + x) * 2 + 1] = half(my);
             }
     }
 };
@@ -731,6 +809,11 @@ int main(int argc, char** argv) {
     const uint32_t W = argc > 3 ? atoi(argv[3]) : 1920, Hh = argc > 4 ? atoi(argv[4]) : 1080;
     const uint32_t RW = argc > 5 ? atoi(argv[5]) : W, RH = argc > 6 ? atoi(argv[6]) : Hh;
     const int frames = argc > 7 ? atoi(argv[7]) : 4, dump_from = argc > 8 ? atoi(argv[8]) : 2;
+#ifdef _WIN32
+    _mkdir(g_out.c_str());
+#else
+    mkdir(g_out.c_str(), 0755);
+#endif
     g_log = fopen((g_out + "/trace.log").c_str(), "w");
     if (!g_log) die("cannot write to %s", g_out.c_str());
 
@@ -912,7 +995,10 @@ int main(int argc, char** argv) {
         return ffxApiGetResourceVK((void*)im, d, write ? FFX_API_RESOURCE_STATE_UNORDERED_ACCESS : FFX_API_RESOURCE_STATE_GENERIC_READ);
     };
 
-    Scene scene{W, Hh, RW, RH};
+    const float cam_near = getenv("TRACE_NEAR") ? (float)atof(getenv("TRACE_NEAR")) : 0.1f;
+    const float cam_far = getenv("TRACE_FAR") ? (float)atof(getenv("TRACE_FAR")) : 3.402823466e+38f;
+    Scene scene{W, Hh, RW, RH, (cc.flags & FFX_FRAMEGENERATION_ENABLE_DEPTH_INVERTED) != 0, (cc.flags & FFX_FRAMEGENERATION_ENABLE_DEPTH_INFINITE) != 0,
+                cam_near, cam_far, getenv("TRACE_FOV") ? (float)atof(getenv("TRACE_FOV")) : 1.0f};
     for (int frame = 0; frame < frames; frame++) {
         scene.make(frame);
         upload(color, scene.color.data(), scene.color.size());
@@ -944,19 +1030,15 @@ int main(int argc, char** argv) {
         env2("TRACE_MVSCALE", prep.motionVectorScale.x, prep.motionVectorScale.y);
         prep.frameTimeDelta = envf("TRACE_FRAMETIME", 16.6667f);
         prep.reset = frame == 0 || (getenv("TRACE_RESET_AT") && frame == atoi(getenv("TRACE_RESET_AT")));
-        prep.cameraNear = envf("TRACE_NEAR", 0.1f), prep.cameraFar = envf("TRACE_FAR", 3.402823466e+38f);
+        prep.cameraNear = cam_near, prep.cameraFar = cam_far;
         prep.cameraFovAngleVertical = envf("TRACE_FOV", 1.0f);
         prep.viewSpaceToMetersFactor = envf("TRACE_V2M", 1.0f);
         prep.depth = res(depth, VK_FORMAT_R32_SFLOAT, RW, RH, false);
         prep.motionVectors = res(motion, VK_FORMAT_R16G16_SFLOAT, RW, RH, false);
-        {   // the camera: still, or (TRACE_CAMERA=1) moving and turning a little more each frame
-            const float t = getenv("TRACE_CAMERA") ? (float)frame * (float)atof(getenv("TRACE_CAMERA")) : 0.0f;
-            const float yaw = 0.07f * t + 0.013f * t * t, pitch = 0.03f * t;
-            const float f[3] = {std::sin(yaw) * std::cos(pitch), std::sin(pitch), std::cos(yaw) * std::cos(pitch)};
-            const float rgt[3] = {std::cos(yaw), 0.0f, -std::sin(yaw)};
-            const float up[3] = {f[1] * rgt[2] - f[2] * rgt[1], f[2] * rgt[0] - f[0] * rgt[2], f[0] * rgt[1] - f[1] * rgt[0]};
-            const float pos[3] = {0.31f * t, 0.11f * t * t, -0.23f * t};
-            for (int c = 0; c < 3; c++) prep.cameraForward[c] = f[c], prep.cameraRight[c] = rgt[c], prep.cameraUp[c] = up[c], prep.cameraPosition[c] = pos[c];
+        {   // the camera: still, or (TRACE_CAMERA=k) moving and turning; TRACE_CAMERA_API=still tells the provider it is still
+            const Cam c = camera_at(getenv("TRACE_CAMERA_API") && !strcmp(getenv("TRACE_CAMERA_API"), "still") ? 0 : frame);
+            const float *pos = c.pos, *rgt = c.right, *up = c.up, *f = c.fwd;
+            for (int k = 0; k < 3; k++) prep.cameraForward[k] = f[k], prep.cameraRight[k] = rgt[k], prep.cameraUp[k] = up[k], prep.cameraPosition[k] = pos[k];
             logf("CAMERA pos=%.9g,%.9g,%.9g right=%.9g,%.9g,%.9g up=%.9g,%.9g,%.9g fwd=%.9g,%.9g,%.9g near=%.9g far=%.9g fov=%.9g jitter=%.9g,%.9g mvscale=%.9g,%.9g dt=%.9g v2m=%.9g",
                  pos[0], pos[1], pos[2], rgt[0], rgt[1], rgt[2], up[0], up[1], up[2], f[0], f[1], f[2], prep.cameraNear, prep.cameraFar,
                  prep.cameraFovAngleVertical, prep.jitterOffset.x, prep.jitterOffset.y, prep.motionVectorScale.x, prep.motionVectorScale.y,
@@ -986,7 +1068,7 @@ int main(int argc, char** argv) {
         if (frame >= dump_from) {
             char prefix[32];
             snprintf(prefix, sizeof prefix, "f%d", frame);
-            dump_images(prefix, getenv("TRACE_DUMP_ALL") == nullptr);
+            dump_images(prefix, !getenv("TRACE_DUMP_ALL") || !*getenv("TRACE_DUMP_ALL"));   // (unset or empty: only the harness's own images)
             if (getenv("TRACE_DUMP_BUFFERS")) dump_buffers(prefix, (VkDeviceSize)atoll(getenv("TRACE_DUMP_BUFFERS")));
         }
     }
