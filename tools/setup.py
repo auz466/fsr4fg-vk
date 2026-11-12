@@ -14,7 +14,10 @@ import spv_fix
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 MODEL = json.load(open(os.path.join(ROOT, 'data', 'model.json')))
-PREP = {'dilate': 0x021b8b00, 'fwdmv': 0x021bcca0, 'splat': 0x021be070}   # (file offsets in the pinned DLL)
+# (file offsets in the pinned DLL; the dilate pass has three variants, which AMD's DLL picks by the create flags:
+# dilate_display with ENABLE_DISPLAY_RESOLUTION_MOTION_VECTORS, else dilate_jitter with
+# ENABLE_MOTION_VECTORS_JITTER_CANCELLATION, else dilate)
+PREP = {'dilate': 0x021b8b00, 'dilate_display': 0x021bbbc0, 'dilate_jitter': 0x021bf0f0, 'fwdmv': 0x021bcca0, 'splat': 0x021be070}
 
 # what a shader's variable is bound to, by its name in AMD's SPIR-V
 RESOURCES = ['SCRATCH', 'WEIGHTS', 'UBO_TENSOR', 'UBO_FI', 'SAMPLER', 'COLOR_PREV', 'COLOR', 'FLOW0', 'FLOW1', 'SPLAT0', 'SPLAT1',

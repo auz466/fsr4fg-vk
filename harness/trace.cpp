@@ -718,6 +718,7 @@ struct Scene {
     uint32_t w, h, rw, rh;
     bool inverted, infinite;   // (the depth convention of the create flags)
     float near_, far_, fov;
+    uint32_t mw, mh;   // (the motion vectors' size: the render size, or the display size with DISPLAY_RESOLUTION_MOTION_VECTORS)
     static constexpr double WALL_Z = 20.0;   // (the wall: the plane z = 20)
     /// depth at a view distance d, by the create flags' convention
     float depth_at(float d) const {
@@ -757,7 +758,7 @@ struct Scene {
         *v = (1.0 - dot3(q, c.up) / (z * th)) * 0.5;
     }
     void make(int frame) {
-        color.resize((size_t)w * h * 4), depth.resize((size_t)rw * rh), motion.resize((size_t)rw * rh * 2);
+        color.resize((size_t)w * h * 4), depth.resize((size_t)rw * rh), motion.resize((size_t)mw * mh * 2);
         const Cam cam = camera_at(frame), prev = camera_at(frame > 0 ? frame - 1 : 0);
         // (the square: fractions of the picture a frame, so the same scene at any size)
         const float sqx = 0.70f - 0.017f * frame, sqy = 0.35f + 0.006f * frame, sqvx = -0.017f, sqvy = 0.006f, sqr = 0.11f;
@@ -776,22 +777,30 @@ struct Scene {
                     background((float)(p[0] * 50.0), (float)(-p[1] * 50.0), px);   // (about a cell of 48 pixels per unit)
                 }
             }
+        // (depth at the render size, motion at its own; each the same scene)
+        auto sample = [&](uint32_t x, uint32_t y, uint32_t sw, uint32_t sh, float* d, float* mx, float* my) {
+            const float u = (x + 0.5f) / sw, v = (y + 0.5f) / sh;
+            if (std::fabs(u - sqx) < sqr * sh / sw && std::fabs(v - sqy) < sqr) {
+                *d = 2.0f, *mx = -sqvx * sw, *my = -sqvy * sh;   // (the square 2 units away)
+            } else {
+                double p[3], dist, pu, pv;
+                wall(cam, u, v, aspect, p, &dist);
+                project(prev, p, aspect, &pu, &pv);
+                *d = (float)dist, *mx = (float)((pu - u) * sw), *my = (float)((pv - v) * sh);
+            }
+        };
         for (uint32_t y = 0; y < rh; y++)
             for (uint32_t x = 0; x < rw; x++) {
-                const float u = (x + 0.5f) / rw, v = (y + 0.5f) / rh;
-                const bool sq = std::fabs(u - sqx) < sqr * rh / rw && std::fabs(v - sqy) < sqr;
-                float mx, my, d;
-                if (sq) {
-                    d = 2.0f, mx = -sqvx * rw, my = -sqvy * rh;   // (the square 2 units away)
-                } else {
-                    double p[3], dist, pu, pv;
-                    wall(cam, u, v, aspect, p, &dist);
-                    project(prev, p, aspect, &pu, &pv);
-                    d = (float)dist, mx = (float)((pu - u) * rw), my = (float)((pv - v) * rh);
-                }
+                float d, mx, my;
+                sample(x, y, rw, rh, &d, &mx, &my);
                 depth[(size_t)y * rw + x] = depth_at(d);
-                motion[((size_t)y * rw + x) * 2 + 0] = half(mx);
-                motion[((size_t)y * rw + x) * 2 + 1] = half(my);
+            }
+        for (uint32_t y = 0; y < mh; y++)
+            for (uint32_t x = 0; x < mw; x++) {
+                float d, mx, my;
+                sample(x, y, mw, mh, &d, &mx, &my);
+                motion[((size_t)y * mw + x) * 2 + 0] = half(mx);
+                motion[((size_t)y * mw + x) * 2 + 1] = half(my);
             }
     }
 };
@@ -977,7 +986,9 @@ int main(int argc, char** argv) {
 
     VkImage color = our_image(color_format, W, Hh, "in_color");
     VkImage depth = our_image(VK_FORMAT_R32_SFLOAT, RW, RH, "in_depth");
-    VkImage motion = our_image(VK_FORMAT_R16G16_SFLOAT, RW, RH, "in_motion");
+    const bool display_mv = (cc.flags & FFX_FRAMEGENERATION_ENABLE_DISPLAY_RESOLUTION_MOTION_VECTORS) != 0;
+    const uint32_t MW = display_mv ? W : RW, MH = display_mv ? Hh : RH;
+    VkImage motion = our_image(VK_FORMAT_R16G16_SFLOAT, MW, MH, "in_motion");
     VkImage made_all[4];
     for (int k = 0; k < 4; k++) {
         char nm[16];
@@ -998,7 +1009,7 @@ int main(int argc, char** argv) {
     const float cam_near = getenv("TRACE_NEAR") ? (float)atof(getenv("TRACE_NEAR")) : 0.1f;
     const float cam_far = getenv("TRACE_FAR") ? (float)atof(getenv("TRACE_FAR")) : 3.402823466e+38f;
     Scene scene{W, Hh, RW, RH, (cc.flags & FFX_FRAMEGENERATION_ENABLE_DEPTH_INVERTED) != 0, (cc.flags & FFX_FRAMEGENERATION_ENABLE_DEPTH_INFINITE) != 0,
-                cam_near, cam_far, getenv("TRACE_FOV") ? (float)atof(getenv("TRACE_FOV")) : 1.0f};
+                cam_near, cam_far, getenv("TRACE_FOV") ? (float)atof(getenv("TRACE_FOV")) : 1.0f, MW, MH};
     for (int frame = 0; frame < frames; frame++) {
         scene.make(frame);
         upload(color, scene.color.data(), scene.color.size());
@@ -1034,7 +1045,7 @@ int main(int argc, char** argv) {
         prep.cameraFovAngleVertical = envf("TRACE_FOV", 1.0f);
         prep.viewSpaceToMetersFactor = envf("TRACE_V2M", 1.0f);
         prep.depth = res(depth, VK_FORMAT_R32_SFLOAT, RW, RH, false);
-        prep.motionVectors = res(motion, VK_FORMAT_R16G16_SFLOAT, RW, RH, false);
+        prep.motionVectors = res(motion, VK_FORMAT_R16G16_SFLOAT, MW, MH, false);
         {   // the camera: still, or (TRACE_CAMERA=k) moving and turning; TRACE_CAMERA_API=still tells the provider it is still
             const Cam c = camera_at(getenv("TRACE_CAMERA_API") && !strcmp(getenv("TRACE_CAMERA_API"), "still") ? 0 : frame);
             const float *pos = c.pos, *rgt = c.right, *up = c.up, *f = c.fwd;

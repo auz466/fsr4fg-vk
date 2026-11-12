@@ -252,6 +252,7 @@ struct Context {
     bool prepare_reset = false;
     uint32_t render_w = 0, render_h = 0;
     Mat4 clip_to_world_prev = identity(), clip_to_world_prev2 = identity();
+    float jitter_prev[2] = {0.0f, 0.0f};   // (the previous prepare's jitter; a reset keeps it, as AMD's does)
     uint32_t debug_color = 0;
 
     // ffxConfigure
@@ -639,9 +640,8 @@ ffxReturnCode_t create(ffxContext* out, ffxCreateContextDescHeader* header) {
         say(true, "a display of %ux%u is outside what the network was built for", desc->displaySize.width, desc->displaySize.height);
         return FFX_API_RETURN_ERROR_PARAMETER;
     }
-    const uint32_t unsupported = FFX_FRAMEGENERATION_ENABLE_ASYNC_WORKLOAD_SUPPORT | FFX_FRAMEGENERATION_ENABLE_DISPLAY_RESOLUTION_MOTION_VECTORS |
-                                 FFX_FRAMEGENERATION_ENABLE_MOTION_VECTORS_JITTER_CANCELLATION;
-    if (desc->flags & unsupported) say(true, "context flags 0x%x are not implemented and are ignored", desc->flags & unsupported);
+    if (desc->flags & FFX_FRAMEGENERATION_ENABLE_ASYNC_WORKLOAD_SUPPORT) say(true, "ENABLE_ASYNC_WORKLOAD_SUPPORT is not implemented and is ignored");
+
 
     Context* c = new Context;
     c->device = dc.vkDevice, c->physical = dc.vkPhysicalDevice;
@@ -716,7 +716,10 @@ ffxReturnCode_t create(ffxContext* out, ffxCreateContextDescHeader* header) {
     const size_t gen_count = c->big ? std::size(GEN_PASSES_8K) : std::size(GEN_PASSES_4K);
     if (ok) {
         c->passes.resize(gen_count);
-        ok = make_pass(*c, c->dilate, GEN_DILATE, sizeof(CsDilate)) && make_pass(*c, c->splat, GEN_SPLAT, sizeof(CsSplat)) &&
+        // (the dilate pass's variant by the create flags, as AMD's DLL picks it: traced)
+        const GenPass& dilate = (desc->flags & FFX_FRAMEGENERATION_ENABLE_DISPLAY_RESOLUTION_MOTION_VECTORS) ? GEN_DILATE_DISPLAY
+                              : (desc->flags & FFX_FRAMEGENERATION_ENABLE_MOTION_VECTORS_JITTER_CANCELLATION) ? GEN_DILATE_JITTER : GEN_DILATE;
+        ok = make_pass(*c, c->dilate, dilate, sizeof(CsDilate)) && make_pass(*c, c->splat, GEN_SPLAT, sizeof(CsSplat)) &&
              make_pass(*c, c->fwd, GEN_FWDMV, sizeof(CsFwdMv));
         for (size_t i = 0; ok && i < gen_count; i++) ok = make_pass(*c, c->passes[i], gen[i], sizeof(CsFi));
     }
@@ -838,6 +841,12 @@ ffxReturnCode_t prepare(Context& c, const ffxDispatchDescFrameGenerationPrepareV
     dil.displaySize[0] = c.width, dil.displaySize[1] = c.height;
     dil.dispatchSize[0] = c.third_w, dil.dispatchSize[1] = c.third_h;
     dil.motionVectorScale[0] = d.motionVectorScale.x, dil.motionVectorScale[1] = d.motionVectorScale.y;
+    if (c.flags & FFX_FRAMEGENERATION_ENABLE_MOTION_VECTORS_JITTER_CANCELLATION) {
+        // (as AMD's: the jitter that went from the previous frame to this one, in the motion vectors' own units)
+        dil.motionVectorJitterCancellation[0] = (c.jitter_prev[0] - d.jitterOffset.x) / d.motionVectorScale.x;
+        dil.motionVectorJitterCancellation[1] = (c.jitter_prev[1] - d.jitterOffset.y) / d.motionVectorScale.y;
+    }
+    c.jitter_prev[0] = d.jitterOffset.x, c.jitter_prev[1] = d.jitterOffset.y;
     dil.depthInverted = inverted;
     for (int i = 0; i < 2; i++)
         dil.generationRectMinUV[i] = dil.colorRectMinUV[i] = min_uv[i], dil.generationRectMaxUV[i] = dil.colorRectMaxUV[i] = max_uv[i];
