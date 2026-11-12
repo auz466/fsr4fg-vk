@@ -364,6 +364,93 @@ bool amd_memory_usage(Context& c, uint64_t* total, uint64_t* aliasable) {
     *aliasable = scratch + weights + 2 * flow + 3 * third2 + 4 * splat;
     return true;
 }
+/// What AMD's DLL answers to FFX_API_QUERY_DESC_TYPE_FRAMEGENERATION_GPU_MEMORY_USAGE_V2: not its own resources but its
+/// FSR 3 frame generation's estimate (traced). Adapted from AMD's FidelityFX SDK 2.4.0 (MIT, Copyright (C) Advanced
+/// Micro Devices, Inc.: framegeneration/fsr3/internal/ffx_frameinterpolation.cpp ffxFrameInterpolationGetGpuMemoryUsage,
+/// ffx_opticalflow.cpp ffxOpticalflowGetGpuMemoryUsage, backend/vk/ffx_vk.cpp ffxGetResourceSizeFromDescriptionVK):
+/// the driver's memory requirements of each resource description, summed, the shared frame interpolation resources
+/// twice. See THIRD_PARTY_NOTICES.
+bool fsr3_memory_usage_v2(const VkDeviceContext& dc, FfxApiDimensions2D render, FfxApiDimensions2D display, VkFormat history,
+                          uint64_t* total, uint64_t* aliasable) {
+    const auto create_image = (PFN_vkCreateImage)dc.vkDeviceProcAddr(dc.vkDevice, "vkCreateImage");
+    const auto destroy_image = (PFN_vkDestroyImage)dc.vkDeviceProcAddr(dc.vkDevice, "vkDestroyImage");
+    const auto image_req = (PFN_vkGetImageMemoryRequirements)dc.vkDeviceProcAddr(dc.vkDevice, "vkGetImageMemoryRequirements");
+    const auto create_buffer = (PFN_vkCreateBuffer)dc.vkDeviceProcAddr(dc.vkDevice, "vkCreateBuffer");
+    const auto destroy_buffer = (PFN_vkDestroyBuffer)dc.vkDeviceProcAddr(dc.vkDevice, "vkDestroyBuffer");
+    const auto buffer_req = (PFN_vkGetBufferMemoryRequirements)dc.vkDeviceProcAddr(dc.vkDevice, "vkGetBufferMemoryRequirements");
+    if (!create_image || !destroy_image || !image_req || !create_buffer || !destroy_buffer || !buffer_req) return false;
+    enum Use { RO = 0, UAV = 1, RT_UAV = 2 };
+    bool ok = true;
+    *total = *aliasable = 0;
+    auto image = [&](VkFormat f, uint32_t w, uint32_t h, uint32_t mips, Use use, bool alias, int times = 1) {
+        // (SDK: sampled and transfer-dst always; storage and transfer-src with UAV; colour attachment with a render
+        // target; an sRGB format with UAV becomes its UNORM one, mutable)
+        VkImageCreateInfo ci{VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO};
+        ci.imageType = VK_IMAGE_TYPE_2D, ci.format = f, ci.extent = {w, h, 1}, ci.arrayLayers = 1, ci.samples = VK_SAMPLE_COUNT_1_BIT;
+        ci.mipLevels = mips ? mips : 1 + (uint32_t)std::floor(std::log2((double)std::max(w, h)));
+        ci.tiling = VK_IMAGE_TILING_OPTIMAL, ci.sharingMode = VK_SHARING_MODE_EXCLUSIVE;
+        ci.usage = VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT;
+        if (use != RO) ci.usage |= VK_IMAGE_USAGE_STORAGE_BIT | VK_IMAGE_USAGE_TRANSFER_SRC_BIT;
+        if (use == RT_UAV) ci.usage |= VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT;
+        if (use != RO && (f == VK_FORMAT_R8G8B8A8_SRGB || f == VK_FORMAT_B8G8R8A8_SRGB)) {
+            ci.flags |= VK_IMAGE_CREATE_MUTABLE_FORMAT_BIT;
+            ci.format = f == VK_FORMAT_R8G8B8A8_SRGB ? VK_FORMAT_R8G8B8A8_UNORM : VK_FORMAT_B8G8R8A8_UNORM;
+        }
+        VkImage im;
+        if (!w || !h || create_image(dc.vkDevice, &ci, nullptr, &im) != VK_SUCCESS) {
+            ok = false;
+            return;
+        }
+        VkMemoryRequirements mr;
+        image_req(dc.vkDevice, im, &mr);
+        destroy_image(dc.vkDevice, im, nullptr);
+        *total += mr.size * times;
+        if (alias) *aliasable += mr.size * times;
+    };
+    // frame interpolation, internal
+    const uint32_t rw = render.width, rh = render.height, dw = display.width, dh = display.height;
+    image(VK_FORMAT_R32_UINT, rw, rh, 1, UAV, true);                           // reconstructedDepthInterpolatedFrame
+    image(VK_FORMAT_R32_UINT, rw, rh, 1, UAV, true);                           // gameMotionVectorFieldX
+    image(VK_FORMAT_R32_UINT, rw, rh, 1, UAV, true);                           // gameMotionVectorFieldY
+    image(VK_FORMAT_R16G16B16A16_SFLOAT, dw / 2, dh / 2, 0, UAV, true);        // inpaintingPyramid (a full mip chain)
+    {   // counters: a buffer of 8 bytes, UAV
+        VkBufferCreateInfo bi{VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO};
+        bi.size = 8, bi.usage = VK_BUFFER_USAGE_TRANSFER_SRC_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT | VK_BUFFER_USAGE_STORAGE_BUFFER_BIT;
+        VkBuffer b;
+        if (create_buffer(dc.vkDevice, &bi, nullptr, &b) != VK_SUCCESS) return false;
+        VkMemoryRequirements mr;
+        buffer_req(dc.vkDevice, b, &mr);
+        destroy_buffer(dc.vkDevice, b, nullptr);
+        *total += mr.size;
+    }
+    image(VK_FORMAT_R32_UINT, dw / 8, dh / 8, 1, UAV, true);                   // opticalFlowMotionVectorFieldX
+    image(VK_FORMAT_R32_UINT, dw / 8, dh / 8, 1, UAV, true);                   // opticalFlowMotionVectorFieldY
+    image(history, dw, dh, 1, UAV, false);                                     // previousInterpolationSource
+    image(VK_FORMAT_R8_UNORM, dw, dh, 1, UAV, true);                           // inpaintingMask
+    image(VK_FORMAT_R8G8_UNORM, rw, rh, 1, UAV, true);                         // disocclusionMask
+    image(VK_FORMAT_R8G8_UNORM, 1, 1, 1, RO, false);                           // defaultDistortionField
+    // frame interpolation, shared: counted twice
+    image(VK_FORMAT_R32_SFLOAT, rw, rh, 1, RT_UAV, false, 2);                  // dilatedDepth
+    image(VK_FORMAT_R16G16_SFLOAT, rw, rh, 1, RT_UAV, false, 2);               // dilatedMotionVectors
+    image(VK_FORMAT_R32_UINT, rw, rh, 1, UAV, false, 2);                       // reconstructedPrevNearestDepth
+    // optical flow: two inputs with six levels, two flows with six levels, the scene change detection
+    const uint32_t fw = (dw + 7) / 8, fh = (dh + 7) / 8;
+    for (int input = 0; input < 2; input++)
+        for (int level = 0; level <= 6; level++) image(VK_FORMAT_R8_UINT, dw >> level, dh >> level, 1, UAV, false);
+    for (int flow = 0; flow < 2; flow++) {
+        uint32_t w = fw, h = fh;
+        for (int level = 0; level <= 6; level++) {
+            image(VK_FORMAT_R16G16_SINT, w, h, 1, UAV, false);
+            w = (w + 1) / 2, h = (h + 1) / 2;
+        }
+    }
+    image(VK_FORMAT_R32_UINT, 256 * 9, 1, 1, UAV, false);                      // SCD histogram
+    image(VK_FORMAT_R32_SFLOAT, 256 * 9, 1, 1, UAV, false);                    // SCD previous histogram
+    image(VK_FORMAT_R32_UINT, 3, 1, 1, UAV, false);                            // SCD temp
+    image(VK_FORMAT_R16G16_SINT, fw, fh, 1, UAV, false);                       // shared: the optical flow
+    image(VK_FORMAT_R32_UINT, 3, 1, 1, UAV, false);                            // shared: SCD output
+    return ok;
+}
 void drop_image(Context& c, Image& im) {
     if (im.view) c.vk.DestroyImageView(c.device, im.view, nullptr);
     if (im.view64) c.vk.DestroyImageView(c.device, im.view64, nullptr);
@@ -1119,12 +1206,18 @@ FFX_API_ENTRY ffxReturnCode_t ffxQuery(ffxContext* context, ffxQueryDescHeader* 
     }
     case FFX_API_QUERY_DESC_TYPE_FRAMEGENERATION_GPU_MEMORY_USAGE_V2: {
         auto* q = (ffxQueryDescFrameGenerationGetGPUMemoryUsageV2*)desc;
-        if (!q->gpuMemoryUsageFrameGeneration) return FFX_API_RETURN_ERROR_PARAMETER;
-        const bool big = q->displaySize.width > 3840 || q->displaySize.height > 2160;
-        const uint64_t scratch = big ? GEN_SCRATCH_BYTES_8K : GEN_SCRATCH_BYTES_4K;
-        q->gpuMemoryUsageFrameGeneration->totalUsageInBytes =
-            scratch + GEN_WEIGHTS_SIZE + (uint64_t)q->displaySize.width * q->displaySize.height * 8 + (uint64_t)q->displaySize.width * q->displaySize.height * 5;
-        q->gpuMemoryUsageFrameGeneration->aliasableUsageInBytes = scratch;
+        if (!q->gpuMemoryUsageFrameGeneration || !q->device) return FFX_API_RETURN_ERROR_PARAMETER;
+        *q->gpuMemoryUsageFrameGeneration = {};
+        const VkDeviceContext& dc = *(const VkDeviceContext*)q->device;
+        if (!dc.vkDevice || !dc.vkDeviceProcAddr) return FFX_API_RETURN_ERROR_PARAMETER;
+        // (the previous interpolation source: the HUD-less format when given, else the back buffer's)
+        FfxApiResourceDescription h{};
+        h.format = q->hudlessBackBufferFormat ? q->hudlessBackBufferFormat : q->backBufferFormat;
+        uint64_t total, aliasable;
+        if (vk_format(h) == VK_FORMAT_UNDEFINED ||
+            !fsr3_memory_usage_v2(dc, q->maxRenderSize, q->displaySize, vk_format(h), &total, &aliasable))
+            return FFX_API_RETURN_ERROR_PARAMETER;
+        q->gpuMemoryUsageFrameGeneration->totalUsageInBytes = total, q->gpuMemoryUsageFrameGeneration->aliasableUsageInBytes = aliasable;
         return FFX_API_RETURN_OK;
     }
     default: return FFX_API_RETURN_ERROR_UNKNOWN_DESCTYPE;

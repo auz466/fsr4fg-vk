@@ -114,16 +114,19 @@ def images(run_dir, frames, gen):
 
 
 # API results not compared, each for a reason:
-#   query versions: AMD's DLL also lists its FSR 3 frame generation provider, which this library does not implement;
-#   query memory v2: AMD's answers with FSR 3's estimate (frame interpolation and optical flow resources), not yet ported.
-NOT_COMPARED = ('query versions', 'query memory v2')
+#   query versions: AMD's DLL also lists its FSR 3 frame generation provider, which this library does not implement.
+NOT_COMPARED = ('query versions',)
 
 
 def api_results(run_dir):
     """every API call's result the harness logged (create, configure, prepare, generate, queries, with what they
     returned), in order"""
-    found = re.findall(r'^=== ([a-z][^\r\n]*?) -> (\d+)', open(os.path.join(run_dir, 'trace.log'), newline='').read(), re.M)
-    return [x for x in found if not x[0].startswith(NOT_COMPARED)]
+    return re.findall(r'^=== ([a-z][^\r\n]*?) -> (\d+)', open(os.path.join(run_dir, 'trace.log'), newline='').read(), re.M)
+
+
+def compared(results):
+    """the results the suite compares (the cache keeps them all)"""
+    return [list(x) for x in results if not x[0].startswith(NOT_COMPARED)]
 
 
 def run(cmd, env, cwd, log):
@@ -186,9 +189,9 @@ def main():
         ok, got = results_of(port_dir + '.out', frames)
         mine = images(port_dir, frames, gen) if os.path.exists(os.path.join(port_dir, 'trace.log')) else {}
         bad = sorted(k for k in set(amd['images']) | set(mine) if amd['images'].get(k) != mine.get(k) or mine.get(k) == 'ALL ZERO')
-        mine_results = [list(x) for x in api_results(port_dir)] if os.path.exists(os.path.join(port_dir, 'trace.log')) else []
-        if mine_results != [list(x) for x in amd.get('results', [])]:
-            bad.append('API results: amd %s, port %s' % (amd.get('results'), mine_results))
+        mine_results = compared(api_results(port_dir)) if os.path.exists(os.path.join(port_dir, 'trace.log')) else []
+        if mine_results != compared(amd.get('results', [])):
+            bad.append('API results: amd %s, port %s' % (compared(amd.get('results', [])), mine_results))
         made = sum(1 for k in amd['images'] if ' out_made' in k)
         if rc or not ok or bad or made != frames * gen:
             failed.append(name)
