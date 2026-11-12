@@ -115,7 +115,7 @@ def main():
         return off, len(blob)
 
     def shader(blob, what):
-        fixed = spv_fix.fix(blob)
+        fixed = spv_fix.for_port(blob)
         tmp = os.path.join(a.out, 'check.spv')
         open(tmp, 'wb').write(fixed)
         if subprocess.run(['spirv-val', '--target-env', 'vulkan1.3', tmp], capture_output=True).returncode != 0 and fixed != blob:

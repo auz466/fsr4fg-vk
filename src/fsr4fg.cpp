@@ -120,43 +120,54 @@ struct Pass {
     uint32_t groups[3]{1, 1, 1};
 };
 
+// ---------------------------------------------------------------- camera matrices
+// Bit for bit as AMD's DLL computes them (fitted from traces of its constants, every element of every frame, in the
+// four depth modes and at two aspects): single precision throughout, products accumulated in index order with each
+// step rounded, and the cofactor inverse below. Its rounding reaches the output: the forward motion pass compares
+// these matrices' reprojection with the motion vectors to within 2 pixels. (Build with -ffp-contract=off.)
 struct Mat4 {
-    double m[4][4];
+    float m[4][4];
 };
 Mat4 identity() {
     Mat4 r{};
-    for (int i = 0; i < 4; i++) r.m[i][i] = 1.0;
+    for (int i = 0; i < 4; i++) r.m[i][i] = 1.0f;
     return r;
 }
 Mat4 mul(const Mat4& a, const Mat4& b) {
-    Mat4 r{};
+    Mat4 r;
     for (int i = 0; i < 4; i++)
-        for (int j = 0; j < 4; j++)
-            for (int k = 0; k < 4; k++) r.m[i][j] += a.m[i][k] * b.m[k][j];
+        for (int j = 0; j < 4; j++) {
+            float s = a.m[i][0] * b.m[0][j];
+            for (int k = 1; k < 4; k++) s = s + a.m[i][k] * b.m[k][j];
+            r.m[i][j] = s;
+        }
     return r;
 }
-/// Gauss-Jordan with partial pivoting. A matrix that cannot be inverted comes back as the identity.
+/// The cofactor inverse (the well-known MESA gluInvertMatrix form, term for term), scaled by 1/det. A singular matrix
+/// gives infinities and NaNs, as it would in AMD's.
 Mat4 inverse(const Mat4& in) {
-    double a[4][8];
-    for (int i = 0; i < 4; i++)
-        for (int j = 0; j < 4; j++) a[i][j] = in.m[i][j], a[i][j + 4] = i == j ? 1.0 : 0.0;
-    for (int c = 0; c < 4; c++) {
-        int p = c;
-        for (int r = c + 1; r < 4; r++)
-            if (std::fabs(a[r][c]) > std::fabs(a[p][c])) p = r;
-        if (std::fabs(a[p][c]) < 1e-300) return identity();
-        for (int j = 0; j < 8; j++) std::swap(a[c][j], a[p][j]);
-        const double d = a[c][c];
-        for (int j = 0; j < 8; j++) a[c][j] /= d;
-        for (int r = 0; r < 4; r++) {
-            if (r == c) continue;
-            const double f = a[r][c];
-            for (int j = 0; j < 8; j++) a[r][j] -= f * a[c][j];
-        }
-    }
-    Mat4 out{};
-    for (int i = 0; i < 4; i++)
-        for (int j = 0; j < 4; j++) out.m[i][j] = a[i][j + 4];
+    const float* m = &in.m[0][0];
+    float inv[16];
+    inv[0] = m[5] * m[10] * m[15] - m[5] * m[11] * m[14] - m[9] * m[6] * m[15] + m[9] * m[7] * m[14] + m[13] * m[6] * m[11] - m[13] * m[7] * m[10];
+    inv[4] = -m[4] * m[10] * m[15] + m[4] * m[11] * m[14] + m[8] * m[6] * m[15] - m[8] * m[7] * m[14] - m[12] * m[6] * m[11] + m[12] * m[7] * m[10];
+    inv[8] = m[4] * m[9] * m[15] - m[4] * m[11] * m[13] - m[8] * m[5] * m[15] + m[8] * m[7] * m[13] + m[12] * m[5] * m[11] - m[12] * m[7] * m[9];
+    inv[12] = -m[4] * m[9] * m[14] + m[4] * m[10] * m[13] + m[8] * m[5] * m[14] - m[8] * m[6] * m[13] - m[12] * m[5] * m[10] + m[12] * m[6] * m[9];
+    inv[1] = -m[1] * m[10] * m[15] + m[1] * m[11] * m[14] + m[9] * m[2] * m[15] - m[9] * m[3] * m[14] - m[13] * m[2] * m[11] + m[13] * m[3] * m[10];
+    inv[5] = m[0] * m[10] * m[15] - m[0] * m[11] * m[14] - m[8] * m[2] * m[15] + m[8] * m[3] * m[14] + m[12] * m[2] * m[11] - m[12] * m[3] * m[10];
+    inv[9] = -m[0] * m[9] * m[15] + m[0] * m[11] * m[13] + m[8] * m[1] * m[15] - m[8] * m[3] * m[13] - m[12] * m[1] * m[11] + m[12] * m[3] * m[9];
+    inv[13] = m[0] * m[9] * m[14] - m[0] * m[10] * m[13] - m[8] * m[1] * m[14] + m[8] * m[2] * m[13] + m[12] * m[1] * m[10] - m[12] * m[2] * m[9];
+    inv[2] = m[1] * m[6] * m[15] - m[1] * m[7] * m[14] - m[5] * m[2] * m[15] + m[5] * m[3] * m[14] + m[13] * m[2] * m[7] - m[13] * m[3] * m[6];
+    inv[6] = -m[0] * m[6] * m[15] + m[0] * m[7] * m[14] + m[4] * m[2] * m[15] - m[4] * m[3] * m[14] - m[12] * m[2] * m[7] + m[12] * m[3] * m[6];
+    inv[10] = m[0] * m[5] * m[15] - m[0] * m[7] * m[13] - m[4] * m[1] * m[15] + m[4] * m[3] * m[13] + m[12] * m[1] * m[7] - m[12] * m[3] * m[5];
+    inv[14] = -m[0] * m[5] * m[14] + m[0] * m[6] * m[13] + m[4] * m[1] * m[14] - m[4] * m[2] * m[13] - m[12] * m[1] * m[6] + m[12] * m[2] * m[5];
+    inv[3] = -m[1] * m[6] * m[11] + m[1] * m[7] * m[10] + m[5] * m[2] * m[11] - m[5] * m[3] * m[10] - m[9] * m[2] * m[7] + m[9] * m[3] * m[6];
+    inv[7] = m[0] * m[6] * m[11] - m[0] * m[7] * m[10] - m[4] * m[2] * m[11] + m[4] * m[3] * m[10] + m[8] * m[2] * m[7] - m[8] * m[3] * m[6];
+    inv[11] = -m[0] * m[5] * m[11] + m[0] * m[7] * m[9] + m[4] * m[1] * m[11] - m[4] * m[3] * m[9] - m[8] * m[1] * m[7] + m[8] * m[3] * m[5];
+    inv[15] = m[0] * m[5] * m[10] - m[0] * m[6] * m[9] - m[4] * m[1] * m[10] + m[4] * m[2] * m[9] + m[8] * m[1] * m[6] - m[8] * m[2] * m[5];
+    const float det = m[0] * inv[0] + m[1] * inv[4] + m[2] * inv[8] + m[3] * inv[12];
+    const float rdet = 1.0f / det;
+    Mat4 out;
+    for (int i = 0; i < 16; i++) (&out.m[0][0])[i] = inv[i] * rdet;
     return out;
 }
 
@@ -240,7 +251,7 @@ struct Context {
     uint64_t prepared_id = 0;
     bool prepare_reset = false;
     uint32_t render_w = 0, render_h = 0;
-    Mat4 view_proj_prev = identity(), view_proj_prev2 = identity();
+    Mat4 clip_to_world_prev = identity(), clip_to_world_prev2 = identity();
     uint32_t debug_color = 0;
 
     // ffxConfigure
@@ -780,28 +791,27 @@ void rect_uv(const Context& c, float* min_uv, float* max_uv) {
 uint8_t* slot_bytes(Context& c) { return (uint8_t*)c.ubo.map + SLOT_BYTES * (1 + c.slot); }
 uint32_t slot_offset(const Context& c, uint32_t block) { return SLOT_BYTES * (1 + c.slot) + block; }
 
-/// World to clip for a camera, as AMD builds it (vectors are rows): the view from the camera's position and axes, the
-/// projection from the vertical field of view, the render size's aspect and the planes, in the depth convention of the
-/// context's flags.
-Mat4 view_projection(const Context& c, const ffxDispatchDescFrameGenerationPrepareV2& d) {
-    const float* r = d.cameraRight;
-    const float* u = d.cameraUp;
-    const float* f = d.cameraForward;
-    const float* p = d.cameraPosition;
-    Mat4 v = identity();
-    for (int i = 0; i < 3; i++) v.m[i][0] = r[i], v.m[i][1] = u[i], v.m[i][2] = f[i];
-    v.m[3][0] = -((double)p[0] * r[0] + (double)p[1] * r[1] + (double)p[2] * r[2]);
-    v.m[3][1] = -((double)p[0] * u[0] + (double)p[1] * u[1] + (double)p[2] * u[2]);
-    v.m[3][2] = -((double)p[0] * f[0] + (double)p[1] * f[1] + (double)p[2] * f[2]);
-    const double sy = 1.0 / std::tan((double)d.cameraFovAngleVertical * 0.5);
-    const double aspect = (double)d.renderSize.width / (double)std::max(1u, d.renderSize.height);
-    const double n = d.cameraNear, fa = d.cameraFar;
+/// Clip to world for a camera, as AMD's DLL computes it (rows are vectors): the inverse of the projection, then the
+/// camera's own axes and position. The projection is left-handed with the vertical field of view and the render
+/// size's aspect; inverted depth swaps the planes, an infinite far plane takes the limit.
+Mat4 clip_to_world(const Context& c, const ffxDispatchDescFrameGenerationPrepareV2& d) {
     const bool inverted = c.flags & FFX_FRAMEGENERATION_ENABLE_DEPTH_INVERTED, infinite = c.flags & FFX_FRAMEGENERATION_ENABLE_DEPTH_INFINITE;
-    Mat4 proj{};
-    proj.m[0][0] = sy / aspect, proj.m[1][1] = sy, proj.m[2][3] = 1.0;
-    if (inverted) proj.m[2][2] = infinite ? 0.0 : -n / (fa - n), proj.m[3][2] = infinite ? n : n * fa / (fa - n);
-    else proj.m[2][2] = infinite ? 1.0 : fa / (fa - n), proj.m[3][2] = infinite ? -n : -n * fa / (fa - n);
-    return mul(v, proj);
+    const float b = 1.0f / std::tan(d.cameraFovAngleVertical * 0.5f);   // (tanf: glibc's is correctly rounded, as Wine's was)
+    const float a = b / ((float)d.renderSize.width / (float)d.renderSize.height);
+    Mat4 p{};
+    p.m[0][0] = a, p.m[1][1] = b, p.m[2][3] = 1.0f;
+    if (infinite) {
+        p.m[2][2] = inverted ? 0.0f : 1.0f;
+        p.m[3][2] = inverted ? d.cameraNear : -d.cameraNear;
+    } else {
+        const float n = inverted ? d.cameraFar : d.cameraNear, f = inverted ? d.cameraNear : d.cameraFar;
+        p.m[2][2] = f / (f - n), p.m[3][2] = n * f / (n - f);   // (not -m22 * n: that differs in the last bit for some planes)
+    }
+    Mat4 cam{};
+    for (int i = 0; i < 3; i++)
+        cam.m[0][i] = d.cameraRight[i], cam.m[1][i] = d.cameraUp[i], cam.m[2][i] = d.cameraForward[i], cam.m[3][i] = d.cameraPosition[i];
+    cam.m[3][3] = 1.0f;
+    return mul(inverse(p), cam);
 }
 
 ffxReturnCode_t prepare(Context& c, const ffxDispatchDescFrameGenerationPrepareV2& d) {
@@ -845,17 +855,15 @@ ffxReturnCode_t prepare(Context& c, const ffxDispatchDescFrameGenerationPrepareV
     splat(SLOT_SPLAT_B, 0.5f, 1);   // the previous frame's motion forward, to the midpoint
     splat(SLOT_SPLAT_C, 0.5f, 0);   // this frame's motion back, to the midpoint
 
-    // The cameras: from the previous frame's clip space to this one's, and to the one before it. Histories that do not
-    // exist yet are the identity, as AMD leaves them.
-    const Mat4 vp = view_projection(c, d);
-    const Mat4 inv_prev = inverse(c.view_proj_prev);
-    const Mat4 a = mul(inv_prev, vp), b = mul(inv_prev, c.view_proj_prev2);
+    // The cameras: prevPsToPs is the inverse of this frame's clip space to the previous one's, prevPsToPrev2Ps the
+    // previous one's to the one before. Histories that do not exist yet are the identity, as AMD starts them.
+    const Mat4 m = clip_to_world(c, d);
+    const Mat4 a = inverse(mul(m, inverse(c.clip_to_world_prev))), b = mul(c.clip_to_world_prev, inverse(c.clip_to_world_prev2));
     CsFwdMv fw{};
-    for (int i = 0; i < 4; i++)
-        for (int j = 0; j < 4; j++) fw.prevPsToPs[i * 4 + j] = (float)a.m[i][j], fw.prevPsToPrev2Ps[i * 4 + j] = (float)b.m[i][j];
+    memcpy(fw.prevPsToPs, a.m, 64), memcpy(fw.prevPsToPrev2Ps, b.m, 64);
     fw.displaySize[0] = c.width, fw.displaySize[1] = c.height;
     memcpy(slot + SLOT_FWD, &fw, sizeof fw);
-    c.view_proj_prev2 = c.view_proj_prev, c.view_proj_prev = vp;
+    c.clip_to_world_prev2 = c.clip_to_world_prev, c.clip_to_world_prev = m;
 
     External ext;
     ext.motion = motion.view, ext.depth = depth.view;

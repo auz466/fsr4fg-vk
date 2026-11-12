@@ -33,6 +33,12 @@ def cases():
         env = {'TRACE_CAMERA': '0.5', 'TRACE_CREATE_FLAGS': str(flags)}
         if not flags & INFINITE: env['TRACE_FAR'] = '1000'
         out['1920x1080_s067_moving_' + nm] = (1920, 1080, 1286, 724, 4, env)
+    # (other fields of view and planes: the camera matrices use tanf and the planes in float)
+    for fov, near, far, nm in (('0.7', '0.05', '500', 'fov07_finite'), ('1.3', '0.3', None, 'fov13_infinite'), ('0.42', '1', '20000', 'fov042_finite'),
+                                 ('0.42', '1', '20000', 'fov042_std_finite')):
+        env = {'TRACE_CAMERA': '0.5', 'TRACE_FOV': fov, 'TRACE_NEAR': near}
+        if far: env.update(TRACE_FAR=far, TRACE_CREATE_FLAGS=str(0 if 'std' in nm else INVERTED))
+        out['2560x1440_s067_moving_' + nm] = (2560, 1440, 1715, 965, 4, env)
     return out
 
 

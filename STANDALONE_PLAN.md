@@ -45,12 +45,15 @@ has not been confirmed making frames in gameplay yet. That is the user's playtes
 - AMD's Vulkan build gives every pass one sampler, nearest-filtered with clamp-to-edge addressing, whatever the shader
   calls it. The port does the same (`FSR4FG_LINEAR=1` overrides it).
 - Every constant block layout comes from the debug names in AMD's SPIR-V (`tools/spv_structs.py`). The camera matrices
-  were fitted from traces:
-  - `prevPsToPs = inverse(VP[n-1]) * VP[n]`
-  - `prevPsToPrev2Ps = inverse(VP[n-1]) * VP[n-2]`
-  - VP is a row-vector view-projection built from the camera vectors, the vertical field of view, the render size's
-    aspect, and the depth convention from the create flags.
-  - Missing history is the identity.
+  were fitted bit for bit from traces (3.1); the earlier fit only held because the old harness scene never made the
+  camera matter:
+  - all single precision; products accumulated in index order; a cofactor (MESA-form) inverse scaled by `1/det`;
+  - `M[n]` (clip to world) `= inverse(P) * [right; up; forward; position]` (rows are vectors);
+  - `P` left-handed: `b = 1/tanf(fov/2)`, `a = b / (renderW/renderH)`, `P23 = 1`; finite planes `P22 = f/(f-n)`,
+    `P32 = n*f/(n-f)` (n and f swapped when inverted); infinite `P22, P32 = 1, -near` or `0, near` (inverted);
+  - `prevPsToPs = inverse(M[n] * inverse(M[n-1]))`, `prevPsToPrev2Ps = M[n-1] * inverse(M[n-2])`;
+  - missing history is the identity; a reset does not clear it.
+  - AMD's forward motion pass uses these only where the motion vectors agree with the camera within 2 pixels.
 - The splat images are `R64_UINT` to their writer and `R32G32_UINT` to their readers. The port creates them as
   `R32G32_UINT`; the 64-bit atomics shader is never rewritten.
 - AMD's DLL under Wine only works with the 7 rewritten shaders. The harness substitutes them by FNV-1a hash of the

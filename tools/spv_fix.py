@@ -3,7 +3,7 @@
 half_images: an image whose sampled type is a 16-bit float is not valid Vulkan SPIR-V (the sampled type must be a 32-bit
 float) and RADV's compiler faults on it. The image becomes a 32-bit float one, and each read from or write to it converts.
 """
-import sys, os
+import os, struct, sys
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from spv import Module, Ins, fnv1a64
 
@@ -99,6 +99,38 @@ def sampled_int64(m):
     m.ins[f:f] = types
     m.dedupe_types()
     return True
+
+
+def output_without_format(m):
+    """The last pass writes the caller's output (rw_prediction) through an image declared Rgba32f, whatever the
+    caller's format: undefined in Vulkan when the view's format differs (RADV converts as if it matched). The image is
+    declared with no format instead, which writes through the view's own (StorageImageWriteWithoutFormat).
+    Only for the port's own copy of the shaders: AMD's DLL runs under Wine with its shaders as they are."""
+    names = {x.w[0]: string_of(x.w[1:]) for x in m.ins if x.op == 5}
+    var = next((x for x in m.ins if x.op == 59 and names.get(x.w[1]) == 'rw_prediction'), None)
+    if var is None: return False
+    ptr = next(x for x in m.ins if x.op == 32 and x.w[0] == var.w[0])
+    image = next(x for x in m.ins if x.op == 25 and x.w[0] == ptr.w[2])
+    if image.w[7] == 0: return False
+    if sum(1 for x in m.ins if x.op == 32 and x.w[2] == image.w[0]) != 1 or sum(1 for x in m.ins if x.op == 59 and x.w[0] == ptr.w[0]) != 1:
+        raise ValueError("rw_prediction's image type is shared")
+    loads = {x.w[1] for x in m.ins if x.op == 61 and x.w[2] == var.w[1]}
+    if any(x.op == 98 and x.w[2] in loads for x in m.ins): raise ValueError('rw_prediction is read')
+    image.w[7] = 0   # Unknown
+    if not any(x.op == 17 and x.w[0] == 56 for x in m.ins):
+        m.ins.insert(next(i for i, x in enumerate(m.ins) if x.op == 17), Ins(17, [56]))   # StorageImageWriteWithoutFormat
+    return True
+
+
+def string_of(ws):
+    b = struct.pack('<%dI' % len(ws), *ws)
+    return b[:b.index(b'\0')].decode()
+
+
+def for_port(blob):
+    """The port's copy of a shader: fix(), and what the spec needs beyond it (output_without_format)."""
+    m = Module(fix(blob))
+    return m.blob() if output_without_format(m) else fix(blob)
 
 
 def fix(blob):
