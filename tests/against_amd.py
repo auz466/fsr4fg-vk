@@ -55,6 +55,11 @@ def cases():
                'TRACE_CREATE_FLAGS': str(INVERTED | INFINITE | flags)}
         env.update(extra)
         out['1920x1080_s067_moving_color_' + nm] = (1920, 1080, 1286, 724, 4, env)
+    # (a HUD-less colour, in the back buffer's format and in its own; a distortion field, which AMD's 4.0.2 refuses)
+    out['1920x1080_s067_moving_hudless'] = (1920, 1080, 1286, 724, 4, {'TRACE_CAMERA': '0.5', 'TRACE_HUD': '1'})
+    out['1920x1080_s067_moving_hudless_own_format'] = (1920, 1080, 1286, 724, 4, {'TRACE_CAMERA': '0.5', 'TRACE_HUD': '1',
+        'TRACE_COLOR_FORMAT': '44', 'TRACE_HUDLESS_FORMAT': '37'})
+    out['1920x1080_s067_moving_distortion'] = (1920, 1080, 1286, 724, 4, {'TRACE_CAMERA': '0.5', 'TRACE_DISTORTION': '2'})
     # (other fields of view and planes: the camera matrices use tanf and the planes in float)
     for fov, near, far, nm in (('0.7', '0.05', '500', 'fov07_finite'), ('1.3', '0.3', None, 'fov13_infinite'), ('0.42', '1', '20000', 'fov042_finite'),
                                  ('0.42', '1', '20000', 'fov042_std_finite')):
@@ -92,6 +97,11 @@ def images(run_dir, frames, gen):
             if m.group(6).startswith('out_made') and not any(open(path, 'rb').read()):
                 out['f%s %s' % (m.group(2), m.group(6))] = 'ALL ZERO'   # (nothing written: never a pass, even if both agree)
     return out
+
+
+def api_results(run_dir):
+    """every API call's result the harness logged (create, configure, prepare, generate, queries), in order"""
+    return re.findall(r'^=== ([a-z][^\r\n]*?) -> (\d+)', open(os.path.join(run_dir, 'trace.log'), newline='').read(), re.M)
 
 
 def run(cmd, env, cwd, log):
@@ -144,7 +154,7 @@ def main():
                 print('%-40s AMD RUN FAILED (rc %d, frames %s): see %s.out' % (name, rc, got, os.path.join(suite, 'amd', name)))
                 failed.append(name)
                 continue
-            amd = {'key': key, 'case': case, 'images': images(amd_dir, frames, gen)}
+            amd = {'key': key, 'case': case, 'images': images(amd_dir, frames, gen), 'results': api_results(amd_dir)}
             json.dump(amd, open(cache, 'w'), indent=1)
         # the port, every time
         port_dir = os.path.join(suite, 'port', name)
@@ -154,6 +164,9 @@ def main():
         ok, got = results_of(port_dir + '.out', frames)
         mine = images(port_dir, frames, gen) if os.path.exists(os.path.join(port_dir, 'trace.log')) else {}
         bad = sorted(k for k in set(amd['images']) | set(mine) if amd['images'].get(k) != mine.get(k) or mine.get(k) == 'ALL ZERO')
+        mine_results = [list(x) for x in api_results(port_dir)] if os.path.exists(os.path.join(port_dir, 'trace.log')) else []
+        if mine_results != [list(x) for x in amd.get('results', [])]:
+            bad.append('API results: amd %s, port %s' % (amd.get('results'), mine_results))
         made = sum(1 for k in amd['images'] if ' out_made' in k)
         if rc or not ok or bad or made != frames * gen:
             failed.append(name)

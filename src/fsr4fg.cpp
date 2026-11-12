@@ -230,7 +230,7 @@ struct Context {
     uint32_t width = 0, height = 0;          // the display size
     uint32_t third_w = 0, third_h = 0;       // a third of it: the preparation's images
     uint32_t tensors[92][2]{};
-    VkFormat color_format = VK_FORMAT_UNDEFINED;
+    VkFormat color_format = VK_FORMAT_UNDEFINED, history_format = VK_FORMAT_UNDEFINED;
     bool big = false;                        // the 8k build of the network
 
     Buffer scratch, weights, weights_staging, ubo;
@@ -252,7 +252,8 @@ struct Context {
     bool prepare_reset = false;
     uint32_t render_w = 0, render_h = 0;
     Mat4 clip_to_world_prev = identity(), clip_to_world_prev2 = identity();
-    float jitter_prev[2] = {0.0f, 0.0f};   // (the previous prepare's jitter; a reset keeps it, as AMD's does)
+    float jitter_prev[2] = {0.0f, 0.0f};
+    FfxApiResource hudless_res{};   // (the HUD-less colour of the last configure; none when its resource is empty)   // (the previous prepare's jitter; a reset keeps it, as AMD's does)
     uint32_t debug_color = 0;
 
     // ffxConfigure
@@ -427,6 +428,7 @@ void drop_pass(Context& c, Pass& p) {
 /// What a frame's passes are given of the caller's: the views of its images (null where the pass has none).
 struct External {
     VkImageView color = VK_NULL_HANDLE, output = VK_NULL_HANDLE, motion = VK_NULL_HANDLE, depth = VK_NULL_HANDLE;
+    VkImageView hudless = VK_NULL_HANDLE;   // (the caller's HUD-less colour, if configured; else the port's 1x1 stand-in)
 };
 /// What the splat pass is bound to: it runs three times a frame over two sets of images.
 struct SplatImages {
@@ -461,7 +463,7 @@ void write_set(Context& c, const Pass& p, VkDescriptorSet set, const External& e
         case RES_FLOW1: im = &c.flow1; break;
         case RES_SPLAT0: im = &c.splat_fwd; break;
         case RES_SPLAT1: im = &c.splat_cur; break;
-        case RES_HUDLESS: im = &c.hudless; break;
+        case RES_HUDLESS: if (ext.hudless) view = ext.hudless; else im = &c.hudless; break;
         case RES_DISTORTION: im = &c.distortion; break;
         case RES_DILATED_MV: im = &c.dilated_mv; break;
         case RES_DILATED_DEPTH: im = &c.dilated_depth; break;
@@ -676,6 +678,14 @@ ffxReturnCode_t create(ffxContext* out, ffxCreateContextDescHeader* header) {
         delete c;
         return FFX_API_RETURN_ERROR_PARAMETER;
     }
+    // (with a HUD-less colour, the network's picture is that one, so the previous frame's copy is in its format: AMD's
+    // keeps it in the format of ffxCreateContextDescFrameGenerationHudless when that is given, traced)
+    c->history_format = c->color_format;
+    if (const auto* hl = (const ffxCreateContextDescFrameGenerationHudless*)find(header, FFX_API_CREATE_CONTEXT_DESC_TYPE_FRAMEGENERATION_HUDLESS)) {
+        FfxApiResourceDescription h{};
+        h.format = hl->hudlessBackBufferFormat;
+        if (vk_format(h) != VK_FORMAT_UNDEFINED) c->history_format = vk_format(h);
+    }
     for (int i = 0; i < 92; i++)
         c->tensors[i][0] = tensor_size(GEN_TENSOR_RULES[i], c->width), c->tensors[i][1] = tensor_size(GEN_TENSOR_RULES[i], c->height);
 
@@ -693,7 +703,7 @@ ffxReturnCode_t create(ffxContext* out, ffxCreateContextDescHeader* header) {
     ok = ok && make_image(*c, c->splat_cur, VK_FORMAT_R32G32_UINT, c->third_w, c->third_h, true) &&
               make_image(*c, c->splat_fwd, VK_FORMAT_R32G32_UINT, c->third_w, c->third_h, true);
     ok = ok && make_image(*c, c->fwd_mv, VK_FORMAT_R16G16_SFLOAT, c->third_w, c->third_h);
-    ok = ok && make_image(*c, c->prev_color, c->color_format, c->width, c->height);
+    ok = ok && make_image(*c, c->prev_color, c->history_format, c->width, c->height);
     ok = ok && make_image(*c, c->distortion, VK_FORMAT_R8G8_UNORM, 1, 1) && make_image(*c, c->hudless, VK_FORMAT_R8G8B8A8_UNORM, 1, 1);
     if (ok) {
         memcpy(c->weights_staging.map, fsr4fg_assets + GEN_WEIGHTS_OFFSET, GEN_WEIGHTS_SIZE);
@@ -910,9 +920,11 @@ ffxReturnCode_t generate(Context& c, const ffxDispatchDescFrameGeneration& d) {
     }
     c.prepared = false;
     if (d.generationRect.width > 0 && d.generationRect.height > 0) c.rect = d.generationRect;
-    Borrowed color, output;
-    if (!borrow(c, cmd, d.presentColor, color, "generate: present colour") || !borrow(c, cmd, d.outputs[0], output, "generate: output")) {
-        give_back(c, cmd, color);
+    Borrowed color, output, hudless;
+    const bool has_hudless = c.hudless_res.resource != nullptr;
+    if (!borrow(c, cmd, d.presentColor, color, "generate: present colour") || !borrow(c, cmd, d.outputs[0], output, "generate: output") ||
+        (has_hudless && !borrow(c, cmd, c.hudless_res, hudless, "generate: HUD-less colour"))) {
+        give_back(c, cmd, color), give_back(c, cmd, output);
         return FFX_API_RETURN_ERROR_PARAMETER;
     }
     // (the tear lines' colour of the debug view: AMD's sequence, a step a frame)
@@ -925,22 +937,26 @@ ffxReturnCode_t generate(Context& c, const ffxDispatchDescFrameGeneration& d) {
     fi.backBufferTransferFunction = d.backbufferTransferFunction;
     fi.dispatchFlags = c.config_flags & (FFX_FRAMEGENERATION_FLAG_DRAW_DEBUG_TEAR_LINES | FFX_FRAMEGENERATION_FLAG_DRAW_DEBUG_RESET_INDICATORS);
     fi.minMaxLuminance[0] = d.minMaxLuminance[0], fi.minMaxLuminance[1] = d.minMaxLuminance[1];
+    fi.hudlessAttachedFactor = has_hudless ? 1 : 0;
     rect_uv(c, fi.generationRectMinUV, fi.generationRectMaxUV);
     memcpy(fi.debugBarColor, bar[c.debug_color], sizeof fi.debugBarColor);
     c.debug_color = (c.debug_color + 1) % 7;
     memcpy(slot_bytes(c) + SLOT_FI, &fi, sizeof fi);
 
     External ext;
-    ext.color = color.view, ext.output = output.view;
+    // (as AMD's, traced: with a HUD-less colour, the network's picture of this frame (r_input_rgb1) is the HUD-less one
+    // and the UI input of the last pass (r_hudless_ui) is the presented colour, HUD and all)
+    ext.color = has_hudless ? hudless.view : color.view, ext.output = output.view, ext.hudless = has_hudless ? color.view : VK_NULL_HANDLE;
     const uint32_t offset = slot_offset(c, SLOT_FI);
     for (Pass& p : c.passes) {
         VkDescriptorSet set = p.sets[p.external ? c.slot : 0];
         if (p.external) write_set(c, p, set, ext, nullptr, false);
         run(c, cmd, p, set, offset);
     }
-    copy(c, cmd, color.image, c.prev_color);
+    copy(c, cmd, has_hudless ? hudless.image : color.image, c.prev_color);
     barrier(c, cmd);
     give_back(c, cmd, color), give_back(c, cmd, output);
+    if (has_hudless) give_back(c, cmd, hudless);
     return FFX_API_RETURN_OK;
 }
 
@@ -983,14 +999,15 @@ FFX_API_ENTRY ffxReturnCode_t ffxConfigure(ffxContext* context, const ffxConfigu
         const auto* d = (const ffxConfigureDescFrameGeneration*)desc;
         c.enabled = d->frameGenerationEnabled, c.config_flags = d->flags;
         if (d->generationRect.width > 0 && d->generationRect.height > 0) c.rect = d->generationRect;
-        if (d->HUDLessColor.resource) say(false, "a HUD-less colour was given: not used");
+        c.hudless_res = d->HUDLessColor;   // (as AMD's: hudlessAttachedFactor 1 and the image bound to the last pass, traced)
         return FFX_API_RETURN_OK;
     }
     case FFX_API_CONFIGURE_DESC_TYPE_FRAMEGENERATION_KEYVALUE: return FFX_API_RETURN_OK;
     case FFX_API_CONFIGURE_DESC_TYPE_FRAMEGENERATION_REGISTERDISTORTIONRESOURCE:
-        if (((const ffxConfigureDescFrameGenerationRegisterDistortionFieldResource*)desc)->distortionField.resource)
-            say(true, "a distortion field was given: not implemented, the picture is taken as undistorted");
-        return FFX_API_RETURN_OK;
+        // (AMD's 4.0.2 refuses it with ERROR_PARAMETER and changes nothing: traced. Its dilate shader binds a distortion
+        // field it never gets.)
+        say(true, "a distortion field is not supported by FSR Frame Generation 4.0.2 (AMD's refuses it too)");
+        return FFX_API_RETURN_ERROR_PARAMETER;
     default: return FFX_API_RETURN_ERROR_UNKNOWN_DESCTYPE;
     }
 }

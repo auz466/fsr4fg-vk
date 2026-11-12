@@ -838,6 +838,31 @@ static std::vector<uint8_t> in_format(const std::vector<uint8_t>& rgba, VkFormat
     }
 }
 
+/// A HUD over the picture (TRACE_HUD): a translucent bar, a block counter that changes every frame, and a crosshair.
+/// What the HUD-less colour lacks.
+static void draw_hud(std::vector<uint8_t>& rgba, uint32_t w, uint32_t h, int frame) {
+    auto px = [&](uint32_t x, uint32_t y) { return &rgba[((size_t)y * w + x) * 4]; };
+    for (uint32_t y = h / 20; y < h / 20 + h / 16; y++)
+        for (uint32_t x = w / 24; x < w / 24 + w * 3 / 10; x++) {
+            uint8_t* p = px(x, y);
+            for (int c = 0; c < 3; c++) p[c] = (uint8_t)((p[c] + 3u * (c == 1 ? 250u : 220u)) / 4u);
+        }
+    const uint32_t cell = std::max(2u, h / 60);
+    for (int bit = 0; bit < 8; bit++)
+        for (uint32_t y = h - 3 * cell; y < h - 2 * cell; y++)
+            for (uint32_t x = w - (12 - bit) * cell; x < w - (11 - bit) * cell; x++) {
+                uint8_t* p = px(x, y);
+                const bool on = ((frame * 37 + 5) >> bit) & 1;
+                p[0] = on ? 255 : 10, p[1] = on ? 255 : 10, p[2] = on ? 255 : 10;
+            }
+    for (uint32_t k = 0; k < h / 30; k++)
+        for (uint32_t t = 0; t < 2; t++) {
+            uint8_t* a = px(w / 2 - h / 60 + k, h / 2 + t);
+            uint8_t* b = px(w / 2 + t, h / 2 - h / 60 + k);
+            a[0] = b[0] = 255, a[1] = b[1] = 40, a[2] = b[2] = 40;
+        }
+}
+
 static void message(uint32_t type, const wchar_t* m) {
     std::string s;
     for (; m && *m; m++) s += (char)*m;
@@ -1004,6 +1029,16 @@ int main(int argc, char** argv) {
     cc.displaySize = {W, Hh}, cc.maxRenderSize = {RW, RH};
     const VkFormat color_format = getenv("TRACE_COLOR_FORMAT") ? (VkFormat)atoi(getenv("TRACE_COLOR_FORMAT")) : VK_FORMAT_R8G8B8A8_UNORM;
     cc.backBufferFormat = ffxApiGetSurfaceFormatVK(color_format);
+    // (TRACE_HUD: a HUD in the presented colour, the HUD-less colour beside it; TRACE_HUDLESS_FORMAT: in its own format,
+    // through the create description for it)
+    const bool hud = getenv("TRACE_HUD") != nullptr;
+    const VkFormat hudless_format = getenv("TRACE_HUDLESS_FORMAT") ? (VkFormat)atoi(getenv("TRACE_HUDLESS_FORMAT")) : color_format;
+    ffxCreateContextDescFrameGenerationHudless hl{};
+    if (getenv("TRACE_HUDLESS_FORMAT")) {
+        hl.header.type = FFX_API_CREATE_CONTEXT_DESC_TYPE_FRAMEGENERATION_HUDLESS, hl.header.pNext = cc.header.pNext;
+        hl.hudlessBackBufferFormat = ffxApiGetSurfaceFormatVK(hudless_format);
+        cc.header.pNext = &hl.header;
+    }
     ffxContext ctx = nullptr;
     logf("=== create context display=%ux%u render=%ux%u flags=0x%x format=%d", W, Hh, RW, RH, cc.flags, color_format);
     r = create(&ctx, &cc.header, nullptr);
@@ -1043,8 +1078,28 @@ int main(int argc, char** argv) {
     const float cam_far = getenv("TRACE_FAR") ? (float)atof(getenv("TRACE_FAR")) : 3.402823466e+38f;
     Scene scene{W, Hh, RW, RH, (cc.flags & FFX_FRAMEGENERATION_ENABLE_DEPTH_INVERTED) != 0, (cc.flags & FFX_FRAMEGENERATION_ENABLE_DEPTH_INFINITE) != 0,
                 cam_near, cam_far, getenv("TRACE_FOV") ? (float)atof(getenv("TRACE_FOV")) : 1.0f, MW, MH};
+    VkImage hudless = hud ? our_image(hudless_format, W, Hh, "in_hudless") : VK_NULL_HANDLE;
+    // (TRACE_DISTORTION=k: a barrel distortion field at the display size, k times as strong; in UV, after - before)
+    VkImage distortion = VK_NULL_HANDLE;
+    if (const char* k = getenv("TRACE_DISTORTION")) {
+        distortion = our_image(VK_FORMAT_R16G16_SFLOAT, W, Hh, "in_distortion");
+        const float strength = (float)atof(k);
+        std::vector<uint16_t> field((size_t)W * Hh * 2);
+        for (uint32_t y = 0; y < Hh; y++)
+            for (uint32_t x = 0; x < W; x++) {
+                const float u = (x + 0.5f) / W - 0.5f, v = (y + 0.5f) / Hh - 0.5f, r2 = u * u + v * v;
+                field[((size_t)y * W + x) * 2 + 0] = half(strength * u * r2);
+                field[((size_t)y * W + x) * 2 + 1] = half(strength * v * r2);
+            }
+        upload(distortion, field.data(), field.size() * 2);
+    }
     for (int frame = 0; frame < frames; frame++) {
         scene.make(frame);
+        if (hud) {
+            const std::vector<uint8_t> clean = in_format(scene.color, hudless_format);
+            upload(hudless, clean.data(), clean.size());
+            draw_hud(scene.color, W, Hh, frame);
+        }
         const std::vector<uint8_t> texels = in_format(scene.color, color_format);
         upload(color, texels.data(), texels.size());
         upload(depth, scene.depth.data(), scene.depth.size() * 4);
@@ -1059,8 +1114,16 @@ int main(int argc, char** argv) {
         cfg.frameID = id;
         // (no swapchain of AMD's: without this flag Configure wants one and fails)
         cfg.flags = getenv("TRACE_CONFIG_FLAGS") ? strtoul(getenv("TRACE_CONFIG_FLAGS"), nullptr, 0) : FFX_FRAMEGENERATION_FLAG_NO_SWAPCHAIN_CONTEXT_NOTIFY;
+        if (hud) cfg.HUDLessColor = res(hudless, hudless_format, W, Hh, false);
         r = configure(&ctx, &cfg.header);
         logf("=== configure -> %u", r);
+        if (distortion) {
+            ffxConfigureDescFrameGenerationRegisterDistortionFieldResource dc{};
+            dc.header.type = FFX_API_CONFIGURE_DESC_TYPE_FRAMEGENERATION_REGISTERDISTORTIONRESOURCE;
+            dc.distortionField = res(distortion, VK_FORMAT_R16G16_SFLOAT, W, Hh, false);
+            r = configure(&ctx, &dc.header);
+            logf("=== configure distortion -> %u", r);
+        }
         begin();
         ffxDispatchDescFrameGenerationPrepareV2 prep{};
         prep.header.type = FFX_API_DISPATCH_DESC_TYPE_FRAMEGENERATION_PREPARE_V2;
