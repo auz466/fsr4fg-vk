@@ -8,8 +8,8 @@
 #                   missing, when the scripts or data/model.json change, or when FSR4FG_AMD_DLL names another file
 #   fsr4fg          build/amd_fidelityfx_framegeneration_vk.so
 #   trace           build/trace, the native harness
-#   trace_exe       build/trace.exe, the harness for AMD's DLL under Wine (with mingw-w64, if found), and a copy of
-#                   AMD's DLL beside it for harness/run_amd.sh
+#   trace_exe       build/wine/trace.exe, the harness for AMD's DLL under Wine (with mingw-w64, if found), and a copy
+#                   of AMD's DLL beside it for harness/run_amd.sh
 cmake_minimum_required(VERSION 3.20)
 project(fsr4fg-vk LANGUAGES CXX ASM)
 
@@ -23,7 +23,7 @@ endif()
 set(FSR4FG_AMD_DLL "$ENV{FSR4FG_AMD_DLL}" CACHE FILEPATH
     "AMD's amd_fidelityfx_framegeneration_vk.dll from FSR SDK 2.4.0 (SHA-256 d002dabf...98b4)")
 option(FSR4FG_BUILD_HARNESS "Build the native test harness (build/trace)" ON)
-option(FSR4FG_BUILD_HARNESS_EXE "Build the Windows test harness (build/trace.exe) with mingw-w64, if found" ON)
+option(FSR4FG_BUILD_HARNESS_EXE "Build the Windows test harness (build/wine/trace.exe) with mingw-w64, if found" ON)
 
 find_package(Python3 REQUIRED COMPONENTS Interpreter)
 find_path(VULKAN_HEADERS_DIR vulkan/vulkan_core.h REQUIRED)
@@ -83,22 +83,25 @@ find_program(MINGW_CXX x86_64-w64-mingw32-g++)
 if(FSR4FG_BUILD_HARNESS_EXE AND MINGW_CXX)
     # (mingw gets its own copy of the Vulkan headers: the host's include directory would bring glibc's with it)
     set(mingw_inc ${CMAKE_BINARY_DIR}/mingw-include)
+    set(WINE_DIR ${CMAKE_BINARY_DIR}/wine)   # (its own directory: CMake would take build/trace.exe for the native trace target)
+    file(MAKE_DIRECTORY ${WINE_DIR})
     file(COPY ${VULKAN_HEADERS_DIR}/vulkan ${VULKAN_HEADERS_DIR}/vk_video DESTINATION ${mingw_inc})
     file(GLOB_RECURSE ffx_headers CONFIGURE_DEPENDS ${FFX_API_DIR}/*.h)
-    set(exe_outputs ${CMAKE_BINARY_DIR}/trace.exe)
-    add_custom_command(OUTPUT ${CMAKE_BINARY_DIR}/trace.exe
+    set(exe_outputs ${WINE_DIR}/trace.exe)
+    add_custom_command(OUTPUT ${WINE_DIR}/trace.exe
         COMMAND ${MINGW_CXX} -std=c++20 ${HARNESS_FLAGS} -I${FFX_API_DIR} -I${mingw_inc} -static
-                ${CMAKE_SOURCE_DIR}/harness/trace.cpp -o ${CMAKE_BINARY_DIR}/trace.exe
+                ${CMAKE_SOURCE_DIR}/harness/trace.cpp -o ${WINE_DIR}/trace.exe
         DEPENDS ${CMAKE_SOURCE_DIR}/harness/trace.cpp ${ffx_headers}
         COMMENT "Building the Windows harness (trace.exe) with mingw-w64"
         VERBATIM)
     if(FSR4FG_AMD_DLL)
-        list(APPEND exe_outputs ${CMAKE_BINARY_DIR}/amd_fidelityfx_framegeneration_vk.dll)
-        add_custom_command(OUTPUT ${CMAKE_BINARY_DIR}/amd_fidelityfx_framegeneration_vk.dll
-            COMMAND ${CMAKE_COMMAND} -E copy ${dll} ${CMAKE_BINARY_DIR}/amd_fidelityfx_framegeneration_vk.dll
+        list(APPEND exe_outputs ${WINE_DIR}/amd_fidelityfx_framegeneration_vk.dll)
+        add_custom_command(OUTPUT ${WINE_DIR}/amd_fidelityfx_framegeneration_vk.dll
+            COMMAND ${CMAKE_COMMAND} -E copy ${dll} ${WINE_DIR}/amd_fidelityfx_framegeneration_vk.dll
             DEPENDS ${dll} ${GEN}/dll_path.txt VERBATIM)
     endif()
-    add_custom_target(trace_exe ALL DEPENDS ${exe_outputs} ${ASSETS})
+    add_custom_target(trace_exe ALL DEPENDS ${exe_outputs})
+    add_dependencies(trace_exe assets)   # (gen/patched; by target, so setup.py runs once)
 elseif(FSR4FG_BUILD_HARNESS_EXE)
     message(STATUS "x86_64-w64-mingw32-g++ not found: no trace.exe, so no runs of AMD's DLL")
 endif()
