@@ -17,7 +17,9 @@ MODEL = json.load(open(os.path.join(ROOT, 'data', 'model.json')))
 # (file offsets in the pinned DLL; the dilate pass has three variants, which AMD's DLL picks by the create flags:
 # dilate_display with ENABLE_DISPLAY_RESOLUTION_MOTION_VECTORS, else dilate_jitter with
 # ENABLE_MOTION_VECTORS_JITTER_CANCELLATION, else dilate)
-PREP = {'dilate': 0x021b8b00, 'dilate_display': 0x021bbbc0, 'dilate_jitter': 0x021bf0f0, 'fwdmv': 0x021bcca0, 'splat': 0x021be070}
+# The watermark pass draws AMD's "MLFI DEBUG VIEW UNSUPPORTED" over the output under FFX_FRAMEGENERATION_FLAG_DRAW_DEBUG_VIEW.
+PREP = {'dilate': 0x021b8b00, 'dilate_display': 0x021bbbc0, 'dilate_jitter': 0x021bf0f0, 'fwdmv': 0x021bcca0, 'splat': 0x021be070,
+        'watermark': 0x021c14a0}
 
 # what a shader's variable is bound to, by its name in AMD's SPIR-V
 RESOURCES = ['SCRATCH', 'WEIGHTS', 'UBO_TENSOR', 'UBO_FI', 'SAMPLER', 'COLOR_PREV', 'COLOR', 'FLOW0', 'FLOW1', 'SPLAT0', 'SPLAT1',
@@ -32,7 +34,7 @@ NAMES = {
     'r_input_mv': 'MOTION', 'r_input_depth': 'DEPTH', 'r_distortion_field': 'DISTORTION', 'rw_output_dilated_mv': 'DILATED_MV',
     'rw_output_downscaled_depth': 'DILATED_DEPTH', 'CsDilate': 'UBO_PREP', 'CsAMDSplatting64Constants': 'UBO_PREP',
     'CsComputeFwdMVUsingMatConstants': 'UBO_PREP', 'r_input_flow': 'SPLAT_FLOW', 'r_depth': 'SPLAT_DEPTH', 'rw_splatted': 'SPLAT_OUT',
-    'r_input_mv0': 'PREV_MV', 'r_input_depth0': 'PREV_DEPTH', 'r_packed_splatted1to0': 'SPLAT_1TO0', 'rw_output_mv_0_to_1': 'FWD_MV',
+    'WatermarkCB': 'UBO_PREP', 'rw_target': 'OUTPUT', 'r_input_mv0': 'PREV_MV', 'r_input_depth0': 'PREV_DEPTH', 'r_packed_splatted1to0': 'SPLAT_1TO0', 'rw_output_mv_0_to_1': 'FWD_MV',
 }
 KINDS = ['SAMPLER', 'SAMPLED', 'STORAGE', 'UBO', 'SSBO']
 

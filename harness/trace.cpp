@@ -1167,6 +1167,11 @@ int main(int argc, char** argv) {
         fg.commandList = (void*)g_cmd;
         fg.presentColor = res(color, color_format, W, Hh, false);
         fg.numGeneratedFrames = getenv("TRACE_GEN") ? atoi(getenv("TRACE_GEN")) : 1;
+        if (const char* gl = getenv("TRACE_GEN_LIST")) {   // (frame by frame: a,b,c...)
+            const char* q = gl;
+            for (int k = 0; k < frame && q; k++) q = strchr(q, ','), q = q ? q + 1 : nullptr;
+            if (q) fg.numGeneratedFrames = (uint32_t)atoi(q);
+        }
         for (uint32_t k = 0; k < fg.numGeneratedFrames && k < 4; k++) fg.outputs[k] = res(made_all[k], color_format, W, Hh, true);
         fg.reset = frame == 0 || (getenv("TRACE_RESET_AT") && frame == atoi(getenv("TRACE_RESET_AT")));
         fg.backbufferTransferFunction = getenv("TRACE_TRANSFER") ? atoi(getenv("TRACE_TRANSFER")) : FFX_API_BACKBUFFER_TRANSFER_FUNCTION_SRGB;

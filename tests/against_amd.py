@@ -66,6 +66,14 @@ def cases():
     out['1920x1080_s067_moving_ids_skip'] = (1920, 1080, 1286, 724, 6, {'TRACE_CAMERA': '0.5', 'TRACE_IDS': '100,101,103,104,107,108'})
     out['1920x1080_s067_moving_ids_repeat'] = (1920, 1080, 1286, 724, 6, {'TRACE_CAMERA': '0.5', 'TRACE_IDS': '100,101,101,102,103,103'})
     out['1920x1080_s067_moving_ids_back'] = (1920, 1080, 1286, 724, 5, {'TRACE_CAMERA': '0.5', 'TRACE_IDS': '100,101,102,90,91'})
+    # (debug flags of the configure description, with NO_SWAPCHAIN_CONTEXT_NOTIFY (8); a reset to show its indicator)
+    for flags, nm in ((1, 'tearlines'), (2, 'resetindicators'), (4, 'debugview'), (16, 'pacinglines'), (1 | 2 | 16, 'alldebug')):
+        out['1920x1080_s067_moving_debug_' + nm] = (1920, 1080, 1286, 724, 5, {'TRACE_CAMERA': '0.5', 'TRACE_CONFIG_FLAGS': str(8 | flags),
+                                                                                'TRACE_RESET_AT': '2'})
+    # (more than one frame asked for an interval: AMD's makes one; none asked for, mid-stream, with no output)
+    for g in (2, 4):
+        out['1920x1080_s067_moving_gen%d' % g] = (1920, 1080, 1286, 724, 4, {'TRACE_CAMERA': '0.5', 'TRACE_GEN': str(g)})
+    out['1920x1080_s067_moving_gen_none_midstream'] = (1920, 1080, 1286, 724, 5, {'TRACE_CAMERA': '0.5', 'TRACE_GEN_LIST': '1,1,0,1,1'})
     # (other fields of view and planes: the camera matrices use tanf and the planes in float)
     for fov, near, far, nm in (('0.7', '0.05', '500', 'fov07_finite'), ('1.3', '0.3', None, 'fov13_infinite'), ('0.42', '1', '20000', 'fov042_finite'),
                                  ('0.42', '1', '20000', 'fov042_std_finite')):
@@ -143,7 +151,7 @@ def main():
     failed = []
     for name, case in todo.items():
         w, h, rw, rh, frames, cenv = case
-        gen = int(cenv.get('TRACE_GEN', '1'))
+        gen = 1   # (AMD's 4.0.2 writes outputs[0] only, whatever is asked for: traced)
         args = [str(x) for x in (w, h, rw, rh, frames, 0)]
         env = {k: v for k, v in os.environ.items() if not k.startswith('TRACE_')}
         env.update(cenv, TRACE_DUMP_ALL='')

@@ -219,6 +219,8 @@ static_assert(sizeof(CsDilate) == 80 && sizeof(CsSplat) == 64 && sizeof(CsFwdMv)
 
 // where each block of a frame's constants is, within its slot
 enum : uint32_t { SLOT_DILATE = 0, SLOT_SPLAT_A = 256, SLOT_FWD = 512, SLOT_SPLAT_B = 768, SLOT_SPLAT_C = 1024, SLOT_FI = 1280, SLOT_BYTES = 1536 };
+// (after the ring: the watermark pass's constants, which never change)
+constexpr uint32_t WATERMARK_OFFSET = SLOT_BYTES * (RING + 1), WATERMARK_BYTES = 736;
 
 struct Context {
     Vk vk;
@@ -238,7 +240,7 @@ struct Context {
     VkSampler sampler = VK_NULL_HANDLE;
     VkDescriptorPool pool = VK_NULL_HANDLE;
 
-    Pass dilate, splat, fwd;
+    Pass dilate, splat, fwd, watermark;
     VkDescriptorSet splat_set_cur = VK_NULL_HANDLE, splat_set_fwd = VK_NULL_HANDLE;
     std::vector<Pass> passes;
 
@@ -251,6 +253,7 @@ struct Context {
     uint64_t prepared_id = 0;
     uint64_t last_id = 0;
     bool has_last_id = false;   // (the frame ID of the last generate, for the gaps that reset)
+    bool said_many = false;
     bool prepare_reset = false;
     uint32_t render_w = 0, render_h = 0;
     Mat4 clip_to_world_prev = identity(), clip_to_world_prev2 = identity();
@@ -606,7 +609,7 @@ void destroy(Context* c) {
     if (c->device) {
         for (auto& ring : c->views)
             for (VkImageView v : ring) c->vk.DestroyImageView(c->device, v, nullptr);
-        drop_pass(*c, c->dilate), drop_pass(*c, c->splat), drop_pass(*c, c->fwd);
+        drop_pass(*c, c->dilate), drop_pass(*c, c->splat), drop_pass(*c, c->fwd), drop_pass(*c, c->watermark);
         for (Pass& p : c->passes) drop_pass(*c, p);
         if (c->pool) c->vk.DestroyDescriptorPool(c->device, c->pool, nullptr);
         if (c->sampler) c->vk.DestroySampler(c->device, c->sampler, nullptr);
@@ -697,7 +700,17 @@ ffxReturnCode_t create(ffxContext* out, ffxCreateContextDescHeader* header) {
                            VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT | VK_BUFFER_USAGE_TRANSFER_SRC_BIT, false);
     ok = ok && make_buffer(*c, c->weights, GEN_WEIGHTS_SIZE, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT, false);
     ok = ok && make_buffer(*c, c->weights_staging, GEN_WEIGHTS_SIZE, VK_BUFFER_USAGE_TRANSFER_SRC_BIT, true);
-    ok = ok && make_buffer(*c, c->ubo, SLOT_BYTES * (RING + 1), VK_BUFFER_USAGE_UNIFORM_BUFFER_BIT, true);
+    ok = ok && make_buffer(*c, c->ubo, WATERMARK_OFFSET + WATERMARK_BYTES, VK_BUFFER_USAGE_UNIFORM_BUFFER_BIT, true);
+    if (ok) {
+        // (the watermark's constants, as AMD's DLL writes them, traced: the same at every size and frame. Four ints, then
+        // the text as ASCII - 32, the rest 0xff)
+        uint8_t* w = (uint8_t*)c->ubo.map + WATERMARK_OFFSET;
+        const int32_t head[4]{30, 361, 3, 1};
+        memcpy(w, head, sizeof head);
+        memset(w + 16, 0xff, WATERMARK_BYTES - 16);
+        const char text[] = "MLFI DEBUG VIEW UNSUPPORTED";
+        for (size_t i = 0; i + 1 < sizeof text; i++) w[16 + i] = (uint8_t)(text[i] - 32);
+    }
     ok = ok && make_image(*c, c->flow0, VK_FORMAT_R16G16_SFLOAT, flow_w, flow_h) && make_image(*c, c->flow1, VK_FORMAT_R16G16_SFLOAT, flow_w, flow_h);
     ok = ok && make_image(*c, c->dilated_mv, VK_FORMAT_R16G16_SFLOAT, c->third_w, c->third_h) && make_image(*c, c->prev_mv, VK_FORMAT_R16G16_SFLOAT, c->third_w, c->third_h);
     ok = ok && make_image(*c, c->dilated_depth, VK_FORMAT_R32_SFLOAT, c->third_w, c->third_h) && make_image(*c, c->prev_depth, VK_FORMAT_R32_SFLOAT, c->third_w, c->third_h);
@@ -732,15 +745,15 @@ ffxReturnCode_t create(ffxContext* out, ffxCreateContextDescHeader* header) {
         const GenPass& dilate = (desc->flags & FFX_FRAMEGENERATION_ENABLE_DISPLAY_RESOLUTION_MOTION_VECTORS) ? GEN_DILATE_DISPLAY
                               : (desc->flags & FFX_FRAMEGENERATION_ENABLE_MOTION_VECTORS_JITTER_CANCELLATION) ? GEN_DILATE_JITTER : GEN_DILATE;
         ok = make_pass(*c, c->dilate, dilate, sizeof(CsDilate)) && make_pass(*c, c->splat, GEN_SPLAT, sizeof(CsSplat)) &&
-             make_pass(*c, c->fwd, GEN_FWDMV, sizeof(CsFwdMv));
+             make_pass(*c, c->fwd, GEN_FWDMV, sizeof(CsFwdMv)) && make_pass(*c, c->watermark, GEN_WATERMARK, WATERMARK_BYTES);
         for (size_t i = 0; ok && i < gen_count; i++) ok = make_pass(*c, c->passes[i], gen[i], sizeof(CsFi));
     }
     if (ok) {
-        uint32_t sets = 2 + 1 + RING, counts[5]{};
+        uint32_t sets = 2 + 1 + RING + RING, counts[5]{};
         auto tally = [&](const Pass& p, uint32_t n) {
             for (uint32_t i = 0; i < p.gen->bind_count; i++) counts[p.gen->binds[i].kind] += n;
         };
-        tally(c->dilate, RING), tally(c->splat, 2), tally(c->fwd, 1);
+        tally(c->dilate, RING), tally(c->splat, 2), tally(c->fwd, 1), tally(c->watermark, RING);
         for (const Pass& p : c->passes) sets += p.external ? RING : 1, tally(p, p.external ? RING : 1);
         const VkDescriptorPoolSize sizes[]{
             {VK_DESCRIPTOR_TYPE_SAMPLER, counts[KIND_SAMPLER] + 1},
@@ -753,7 +766,8 @@ ffxReturnCode_t create(ffxContext* out, ffxCreateContextDescHeader* header) {
         VkDescriptorPoolCreateInfo pi{VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO};
         pi.maxSets = sets, pi.poolSizeCount = (uint32_t)std::size(sizes), pi.pPoolSizes = sizes;
         ok = c->vk.CreateDescriptorPool(c->device, &pi, nullptr, &c->pool) == VK_SUCCESS;
-        ok = ok && allocate_sets(*c, c->dilate, RING) && allocate_sets(*c, c->splat, 2) && allocate_sets(*c, c->fwd, 1);
+        ok = ok && allocate_sets(*c, c->dilate, RING) && allocate_sets(*c, c->splat, 2) && allocate_sets(*c, c->fwd, 1) &&
+             allocate_sets(*c, c->watermark, RING);
         for (size_t i = 0; ok && i < gen_count; i++) ok = allocate_sets(*c, c->passes[i], c->passes[i].external ? RING : 1);
         if (!ok) say(true, "the descriptor sets were not made");
     }
@@ -912,10 +926,13 @@ ffxReturnCode_t prepare(Context& c, const ffxDispatchDescFrameGenerationPrepareV
 ffxReturnCode_t generate(Context& c, const ffxDispatchDescFrameGeneration& d) {
     VkCommandBuffer cmd = (VkCommandBuffer)d.commandList;
     if (!cmd) return FFX_API_RETURN_ERROR_PARAMETER;
-    if (d.numGeneratedFrames != 1) {
-        say(true, "%u frames asked for an interval: one is what this library makes", d.numGeneratedFrames);
-        return FFX_API_RETURN_ERROR_PARAMETER;
+    // (as AMD's 4.0.2, traced: any number of frames asked for makes one, in outputs[0], and returns OK; with none asked
+    // for and no output, every pass but the one that writes the output still runs, so the next frame is the same)
+    if (d.numGeneratedFrames > 1 && !c.said_many) {
+        say(false, "%u frames asked for an interval: FSR Frame Generation 4.0.2 makes one, in outputs[0] (as AMD's does)", d.numGeneratedFrames);
+        c.said_many = true;
     }
+    const bool has_output = d.numGeneratedFrames > 0 && d.outputs[0].resource;
     if (!c.prepared || c.prepared_id != d.frameID) {
         say(true, "frame %llu was not prepared (ffxDispatchDescFrameGenerationPrepareV2 comes first)", (unsigned long long)d.frameID);
         return FFX_API_RETURN_ERROR_PARAMETER;
@@ -924,7 +941,7 @@ ffxReturnCode_t generate(Context& c, const ffxDispatchDescFrameGeneration& d) {
     if (d.generationRect.width > 0 && d.generationRect.height > 0) c.rect = d.generationRect;
     Borrowed color, output, hudless;
     const bool has_hudless = c.hudless_res.resource != nullptr;
-    if (!borrow(c, cmd, d.presentColor, color, "generate: present colour") || !borrow(c, cmd, d.outputs[0], output, "generate: output") ||
+    if (!borrow(c, cmd, d.presentColor, color, "generate: present colour") || (has_output && !borrow(c, cmd, d.outputs[0], output, "generate: output")) ||
         (has_hudless && !borrow(c, cmd, c.hudless_res, hudless, "generate: HUD-less colour"))) {
         give_back(c, cmd, color), give_back(c, cmd, output);
         return FFX_API_RETURN_ERROR_PARAMETER;
@@ -941,7 +958,8 @@ ffxReturnCode_t generate(Context& c, const ffxDispatchDescFrameGeneration& d) {
     c.last_id = d.frameID, c.has_last_id = true;
     fi.reset = (d.reset || c.prepare_reset || gap) ? 1 : 0;
     fi.backBufferTransferFunction = d.backbufferTransferFunction;
-    fi.dispatchFlags = c.config_flags & (FFX_FRAMEGENERATION_FLAG_DRAW_DEBUG_TEAR_LINES | FFX_FRAMEGENERATION_FLAG_DRAW_DEBUG_RESET_INDICATORS);
+    fi.dispatchFlags = c.config_flags & (FFX_FRAMEGENERATION_FLAG_DRAW_DEBUG_TEAR_LINES | FFX_FRAMEGENERATION_FLAG_DRAW_DEBUG_RESET_INDICATORS |
+                                         FFX_FRAMEGENERATION_FLAG_DRAW_DEBUG_VIEW);
     fi.minMaxLuminance[0] = d.minMaxLuminance[0], fi.minMaxLuminance[1] = d.minMaxLuminance[1];
     fi.hudlessAttachedFactor = has_hudless ? 1 : 0;
     rect_uv(c, fi.generationRectMinUV, fi.generationRectMaxUV);
@@ -955,11 +973,21 @@ ffxReturnCode_t generate(Context& c, const ffxDispatchDescFrameGeneration& d) {
     ext.color = has_hudless ? hudless.view : color.view, ext.output = output.view, ext.hudless = has_hudless ? color.view : VK_NULL_HANDLE;
     const uint32_t offset = slot_offset(c, SLOT_FI);
     for (Pass& p : c.passes) {
+        if (!has_output && std::any_of(p.gen->binds, p.gen->binds + p.gen->bind_count, [](const GenBind& b) { return b.res == RES_OUTPUT; })) continue;
         VkDescriptorSet set = p.sets[p.external ? c.slot : 0];
         if (p.external) write_set(c, p, set, ext, nullptr, false);
         run(c, cmd, p, set, offset);
     }
     copy(c, cmd, has_hudless ? hudless.image : color.image, c.prev_color);
+    if (has_output && (c.config_flags & FFX_FRAMEGENERATION_FLAG_DRAW_DEBUG_VIEW)) {
+        // (AMD's 4.0.2 has no debug view: it stamps "MLFI DEBUG VIEW UNSUPPORTED" on the output instead, 82x48 groups
+        // whatever the size, traced; the port does the same)
+        VkDescriptorSet set = c.watermark.sets[c.slot];
+        write_set(c, c.watermark, set, ext, nullptr, false);
+        barrier(c, cmd);
+        c.watermark.groups[0] = 82, c.watermark.groups[1] = 48, c.watermark.groups[2] = 1;
+        run(c, cmd, c.watermark, set, WATERMARK_OFFSET);
+    }
     barrier(c, cmd);
     give_back(c, cmd, color), give_back(c, cmd, output);
     if (has_hudless) give_back(c, cmd, hudless);
