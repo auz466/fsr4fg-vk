@@ -24,12 +24,17 @@
 // Frames in flight: up to RING - 1 = 15 frames of one context's work may be on the GPU unfinished. ffxDestroyContext
 // does not wait for the GPU: the caller must have finished the work that used the context.
 // Host memory: the context itself comes from the caller's ffxAllocationCallbacks when given.
+// Barriers: one only where a command touches what an earlier one since the last barrier wrote, or writes what one read
+// (Dep, need()); the network's passes all share one scratch buffer, so each waits for the one before, but a border pass
+// (zeros to a tensor's border) shares the barrier of the pass before it at the display sizes where that was measured to
+// change nothing (border_joins). Pipelines: compiled at create, through an optional VkPipelineCache on disk (open_cache).
 //
 // Not done: AMD's swapchain and pacing (the caller presents; workstream 3.5), the FSR 3 provider AMD's DLL also
 // carries, ENABLE_ASYNC_WORKLOAD_SUPPORT.
 #include <vulkan/vulkan.h>
 
 #include <algorithm>
+#include <chrono>
 #include <cmath>
 #include <cstdarg>
 #include <cstdint>
@@ -43,6 +48,8 @@
 #include <vector>
 
 #include <dlfcn.h>
+#include <sys/stat.h>
+#include <unistd.h>
 
 // (AMD's header marks the entry points __declspec(dllexport): here that is default visibility, with everything else hidden)
 #define __declspec(x) __attribute__((visibility("default")))
@@ -111,7 +118,7 @@ void say(bool error, const char* fmt, ...) {
     X(DestroyPipelineLayout) X(CreateComputePipelines) X(DestroyPipeline) X(CreateDescriptorPool)                      \
     X(DestroyDescriptorPool) X(AllocateDescriptorSets) X(UpdateDescriptorSets) X(CmdBindPipeline)                      \
     X(CmdBindDescriptorSets) X(CmdDispatch) X(CmdPipelineBarrier) X(CmdCopyImage) X(CmdCopyBuffer)                     \
-    X(CmdClearColorImage) X(CmdFillBuffer)
+    X(CmdClearColorImage) X(CmdFillBuffer) X(CreatePipelineCache) X(DestroyPipelineCache) X(GetPipelineCacheData)
 struct Vk {
 #define DECL(n) PFN_vk##n n = nullptr;
     DEVICE_FUNCS(DECL)
@@ -145,6 +152,20 @@ struct Pass {
     bool dynamic = false;   // has a per-frame constants block (bound with a dynamic offset)
     uint32_t dynamic_range = 0;
     uint32_t groups[3]{1, 1, 1};
+    uint64_t reads = 0, writes = 0;   // (what it reads and writes, as Dep bits: from its bindings)
+    bool joins = false;   // a border pass that shares the barrier of the pass before it (see border_joins)
+};
+
+// What the GPU work of a dispatch reads and writes, one bit a resource: a barrier goes in only where a command touches
+// what an earlier one since the last barrier wrote (read or write after write), or writes what one read (write after
+// read). Commands with no hazard between them share one, so the order of the work, and so its results, are unchanged.
+enum Dep : uint64_t {
+    D_SCRATCH = 1u << 0, D_WEIGHTS = 1u << 1, D_FLOW0 = 1u << 2, D_FLOW1 = 1u << 3, D_DILATED_MV = 1u << 4, D_PREV_MV = 1u << 5,
+    D_DILATED_DEPTH = 1u << 6, D_PREV_DEPTH = 1u << 7, D_SPLAT_CUR = 1u << 8, D_SPLAT_FWD = 1u << 9, D_FWD_MV = 1u << 10,
+    D_PREV_COLOR = 1u << 11, D_DISTORTION = 1u << 12, D_HUDLESS = 1u << 13,
+    D_CALLER = 1u << 14,          // (the caller's images the passes read: colour, HUD-less colour, motion, depth)
+    D_OUTPUT = 1u << 15,          // (the caller's image the generated frame goes to)
+    D_ALL = ~0ull,
 };
 
 // ---------------------------------------------------------------- camera matrices
@@ -251,8 +272,11 @@ constexpr uint32_t WATERMARK_OFFSET = SLOT_BYTES * (RING + 1), WATERMARK_BYTES =
 
 struct Context {
     ffxAllocationCallbacks alloc{};   // (the callbacks it was made with: the context itself came from them)
+    std::string cache_file;           // (the pipeline cache's file, empty for none)
+    size_t cache_loaded = 0;          // (bytes of it the driver was given at create)
     Vk vk;
     VkDevice device = VK_NULL_HANDLE;
+    VkPipelineCache cache = VK_NULL_HANDLE;   // (only while create makes the pipelines: see open_cache)
     VkPhysicalDevice physical = VK_NULL_HANDLE;
     VkPhysicalDeviceMemoryProperties memory{};
 
@@ -293,6 +317,10 @@ struct Context {
     bool enabled = true;
     uint32_t config_flags = 0;
     FfxApiRect2D rect{};
+
+    // the hazards since the last barrier recorded (see Dep); at a dispatch's start, anything (the caller's work before it)
+    uint64_t pending_reads = 0, pending_writes = D_ALL;
+    uint32_t barriers = 0;   // (recorded by this dispatch so far, for FSR4FG_VERBOSE)
 };
 
 uint32_t memory_type(Context& c, uint32_t bits, VkMemoryPropertyFlags want) {
@@ -534,6 +562,29 @@ VkDescriptorType descriptor_type(const GenBind& b) {
 }
 bool is_external(Res r) { return r == RES_COLOR || r == RES_OUTPUT || r == RES_MOTION || r == RES_DEPTH; }
 
+/// The Dep bit of what a binding names (0 for the constants and the sampler; the splat pass's images, which depend on the
+/// set, are given at its runs).
+uint64_t dep_of(Res r) {
+    switch (r) {
+    case RES_SCRATCH: return D_SCRATCH;
+    case RES_WEIGHTS: return D_WEIGHTS;
+    case RES_COLOR_PREV: return D_PREV_COLOR;
+    case RES_FLOW0: return D_FLOW0;
+    case RES_FLOW1: return D_FLOW1;
+    case RES_SPLAT0: return D_SPLAT_FWD;
+    case RES_SPLAT1: case RES_SPLAT_1TO0: return D_SPLAT_CUR;
+    case RES_HUDLESS: return D_HUDLESS | D_CALLER;   // (the caller's when given, else our 1x1)
+    case RES_DISTORTION: return D_DISTORTION;
+    case RES_DILATED_MV: return D_DILATED_MV;
+    case RES_DILATED_DEPTH: return D_DILATED_DEPTH;
+    case RES_PREV_MV: return D_PREV_MV;
+    case RES_PREV_DEPTH: return D_PREV_DEPTH;
+    case RES_FWD_MV: return D_FWD_MV;
+    case RES_COLOR: case RES_MOTION: case RES_DEPTH: return D_CALLER;
+    case RES_OUTPUT: return D_OUTPUT;
+    default: return 0;   // (constants, sampler, and the splat pass's set-dependent images)
+    }
+}
 bool make_pass(Context& c, Pass& p, const GenPass& gen, uint32_t dynamic_range) {
     p.gen = &gen;
     p.dynamic_range = dynamic_range;
@@ -565,13 +616,20 @@ bool make_pass(Context& c, Pass& p, const GenPass& gen, uint32_t dynamic_range) 
     VkPipelineShaderStageRequiredSubgroupSizeCreateInfo wave{VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_REQUIRED_SUBGROUP_SIZE_CREATE_INFO};
     wave.requiredSubgroupSize = 32;
     if (strncmp(gen.entry, "mlfi_", 5) == 0) ci.stage.pNext = &wave;
-    const VkResult r = c.vk.CreateComputePipelines(c.device, VK_NULL_HANDLE, 1, &ci, nullptr, &p.pipeline);
+    const VkResult r = c.vk.CreateComputePipelines(c.device, c.cache, 1, &ci, nullptr, &p.pipeline);
     c.vk.DestroyShaderModule(c.device, module, nullptr);
     if (r != VK_SUCCESS) {
         say(true, "the pipeline of %s was not made (VkResult %d)", gen.entry, (int)r);
         return false;
     }
     for (int d = 0; d < 3; d++) p.groups[d] = term(c, gen.groups[d]);
+    for (uint32_t i = 0; i < gen.bind_count; i++) {
+        const GenBind& b = gen.binds[i];
+        const uint64_t bit = dep_of(b.res);
+        if (b.kind == KIND_SAMPLED) p.reads |= bit;
+        else if (b.kind == KIND_STORAGE || (b.kind == KIND_SSBO && b.res == RES_SCRATCH)) p.reads |= bit, p.writes |= bit;   // (storage: may be both)
+        else if (b.kind == KIND_SSBO) p.reads |= bit;   // (the weights: written once, at initialise)
+    }
     return true;
 }
 bool allocate_sets(Context& c, Pass& p, uint32_t count) {
@@ -655,14 +713,23 @@ void write_set(Context& c, const Pass& p, VkDescriptorSet set, const External& e
 }
 
 void barrier(Context& c, VkCommandBuffer cmd) {
+    c.pending_reads = c.pending_writes = 0;
+    c.barriers++;
     VkMemoryBarrier m{VK_STRUCTURE_TYPE_MEMORY_BARRIER};
     m.srcAccessMask = VK_ACCESS_SHADER_WRITE_BIT | VK_ACCESS_TRANSFER_WRITE_BIT;
     m.dstAccessMask = VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT | VK_ACCESS_UNIFORM_READ_BIT | VK_ACCESS_TRANSFER_READ_BIT | VK_ACCESS_TRANSFER_WRITE_BIT;
     const VkPipelineStageFlags stages = VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT | VK_PIPELINE_STAGE_TRANSFER_BIT;
     c.vk.CmdPipelineBarrier(cmd, stages, stages, 0, 1, &m, 0, nullptr, 0, nullptr);
 }
-void run(Context& c, VkCommandBuffer cmd, const Pass& p, VkDescriptorSet set, uint32_t dynamic_offset, const uint32_t* groups = nullptr) {
-    barrier(c, cmd);
+/// Before a command that reads `reads` and writes `writes`: a barrier if it has a hazard with what came since the last.
+void need(Context& c, VkCommandBuffer cmd, uint64_t reads, uint64_t writes) {
+    if ((reads & c.pending_writes) || (writes & (c.pending_writes | c.pending_reads))) barrier(c, cmd);
+    c.pending_reads |= reads, c.pending_writes |= writes;
+}
+void run(Context& c, VkCommandBuffer cmd, const Pass& p, VkDescriptorSet set, uint32_t dynamic_offset, const uint32_t* groups = nullptr,
+         uint64_t reads = 0, uint64_t writes = 0) {
+    if (p.joins) c.pending_writes |= p.writes;   // (no barrier of its own: border_joins)
+    else need(c, cmd, p.reads | reads, p.writes | writes);
     c.vk.CmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, p.pipeline);
     c.vk.CmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, p.layout, 0, 1, &set, p.dynamic ? 1 : 0, &dynamic_offset);
     const uint32_t* g = groups ? groups : p.groups;
@@ -675,15 +742,16 @@ void image_barrier(Context& c, VkCommandBuffer cmd, VkImage image, VkImageAspect
     b.srcQueueFamilyIndex = b.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
     b.image = image, b.subresourceRange = {aspect, 0, 1, 0, 1};
     c.vk.CmdPipelineBarrier(cmd, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, 0, 0, nullptr, 0, nullptr, 1, &b);
+    c.pending_reads = c.pending_writes = 0;   // (all commands, all memory: as much as barrier())
 }
-void clear(Context& c, VkCommandBuffer cmd, const Image& im) {
-    barrier(c, cmd);
+void clear(Context& c, VkCommandBuffer cmd, const Image& im, uint64_t bit) {
+    need(c, cmd, 0, bit);
     const VkClearColorValue zero{};
     const VkImageSubresourceRange range{VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1};
     c.vk.CmdClearColorImage(cmd, im.image, VK_IMAGE_LAYOUT_GENERAL, &zero, 1, &range);
 }
-void copy(Context& c, VkCommandBuffer cmd, VkImage from, const Image& to) {
-    barrier(c, cmd);
+void copy(Context& c, VkCommandBuffer cmd, VkImage from, const Image& to, uint64_t from_bit, uint64_t to_bit) {
+    need(c, cmd, from_bit, to_bit);
     VkImageCopy r{};
     r.srcSubresource = r.dstSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1};
     r.extent = {to.width, to.height, 1};
@@ -853,6 +921,104 @@ std::string missing_features(VkPhysicalDevice phys) {
     return missing;
 }
 
+// ---------------------------------------------------------------- the pipeline cache
+// The 179 pipelines are compiled at create: 3.2 s on an RX 9070 XT (RADV, Mesa 26.2) from nothing. Mesa keeps its own disk
+// cache of compiled shaders, which already brings that to 14-31 ms; this cache, on top, only matters where that one is
+// off, full or missing (13 ms then), so it is off unless asked for. FSR4FG_PIPELINE_CACHE: unset or 0 = none; 1 =
+// $XDG_CACHE_HOME/fsr4fg-vk (else ~/.cache/fsr4fg-vk); anything else = that directory. One file per device and driver
+// version; the driver also checks the header and ignores what it cannot use.
+std::string cache_path(const VkPhysicalDeviceProperties& p) {
+    const char* opt = getenv("FSR4FG_PIPELINE_CACHE");
+    if (!opt || !*opt || !strcmp(opt, "0")) return {};
+    std::string dir;
+    if (strcmp(opt, "1") != 0) dir = opt;
+    else if (const char* x = getenv("XDG_CACHE_HOME"); x && *x == '/') dir = std::string(x) + "/fsr4fg-vk";
+    else if (const char* h = getenv("HOME"); h && *h) dir = std::string(h) + "/.cache/fsr4fg-vk";
+    else return {};
+    char name[96];   // (the driver keys what is in it by the shaders, so a rebuilt library with other shaders only adds to it)
+    snprintf(name, sizeof name, "/pipelines-%04x-%04x-%08x.bin", p.vendorID, p.deviceID, p.driverVersion);
+    return dir + name;
+}
+/// The cache for create's pipelines, with what was saved last time if it was made by this device and driver.
+void open_cache(Context& c) {
+    void* loader = dlopen("libvulkan.so.1", RTLD_NOW | RTLD_NOLOAD);
+    const auto props = loader ? (PFN_vkGetPhysicalDeviceProperties)dlsym(loader, "vkGetPhysicalDeviceProperties") : nullptr;
+    if (!props) return;
+    VkPhysicalDeviceProperties p;
+    props(c.physical, &p);
+    c.cache_file = cache_path(p);
+    if (c.cache_file.empty()) return;
+    std::vector<uint8_t> data;
+    if (FILE* f = fopen(c.cache_file.c_str(), "rb")) {
+        fseek(f, 0, SEEK_END);
+        const long n = ftell(f);
+        fseek(f, 0, SEEK_SET);
+        if (n > 32 && n < (64l << 20)) {
+            data.resize((size_t)n);
+            if (fread(data.data(), 1, data.size(), f) != data.size()) data.clear();
+        }
+        fclose(f);
+    }
+    // (the header Vulkan defines: length, version 1, vendor, device, the driver's cache UUID; anything else is not offered)
+    uint32_t head[4]{};
+    if (data.size() >= 16 + VK_UUID_SIZE) memcpy(head, data.data(), 16);
+    if (head[0] < 16 + VK_UUID_SIZE || head[1] != VK_PIPELINE_CACHE_HEADER_VERSION_ONE || head[2] != p.vendorID || head[3] != p.deviceID ||
+        memcmp(data.data() + 16, p.pipelineCacheUUID, VK_UUID_SIZE) != 0)
+        data.clear();
+    c.cache_loaded = data.size();
+    VkPipelineCacheCreateInfo ci{VK_STRUCTURE_TYPE_PIPELINE_CACHE_CREATE_INFO};
+    ci.initialDataSize = data.size(), ci.pInitialData = data.empty() ? nullptr : data.data();
+    if (c.vk.CreatePipelineCache(c.device, &ci, nullptr, &c.cache) != VK_SUCCESS) {
+        ci.initialDataSize = 0, ci.pInitialData = nullptr;   // (a driver that refuses the old data: start empty)
+        c.cache_loaded = 0;
+        if (c.vk.CreatePipelineCache(c.device, &ci, nullptr, &c.cache) != VK_SUCCESS) c.cache = VK_NULL_HANDLE;
+    }
+}
+/// Writes the cache back when it grew (written beside it and renamed, so a reader never sees half a file), and drops it.
+void close_cache(Context& c, bool save) {
+    if (!c.cache) return;
+    size_t n = 0;
+    if (save && c.vk.GetPipelineCacheData(c.device, c.cache, &n, nullptr) == VK_SUCCESS && n > c.cache_loaded) {
+        std::vector<uint8_t> data(n);
+        if (c.vk.GetPipelineCacheData(c.device, c.cache, &n, data.data()) == VK_SUCCESS) {
+            const std::string dir = c.cache_file.substr(0, c.cache_file.rfind('/'));
+            for (size_t i = 1; (i = dir.find('/', i)) != std::string::npos; i++) mkdir(dir.substr(0, i).c_str(), 0755);
+            mkdir(dir.c_str(), 0755);
+            const std::string tmp = c.cache_file + "." + std::to_string(getpid()) + ".tmp";
+            bool ok = false;
+            if (FILE* f = fopen(tmp.c_str(), "wb")) ok = fwrite(data.data(), 1, n, f) == n, ok = (fclose(f) == 0) && ok;
+            if (!ok || rename(tmp.c_str(), c.cache_file.c_str()) != 0) {
+                unlink(tmp.c_str());
+                say(false, "the pipeline cache was not saved to %s", c.cache_file.c_str());
+            } else say(false, "pipeline cache: %zu bytes saved to %s", n, c.cache_file.c_str());
+        }
+    }
+    c.vk.DestroyPipelineCache(c.device, c.cache, nullptr);
+    c.cache = VK_NULL_HANDLE;
+}
+
+/// Which border passes need no barrier of their own at this display size. A border pass loads nothing and stores only
+/// zeros, to the border of a tensor the next work pass reads (that one still waits for it). Where the work pass before it
+/// writes nothing but zeros to those same words and does not read them, the two can run together with the same result
+/// to the bit. That was measured with the harness (TRACE_PROBE, tools/probe_borders.py) at each display size in
+/// GEN_BORDER_SIZES; it holds for nearly every pair there, but not for all at every size (pass 189 after 188 at
+/// 1088x1088), so at a size not in the table every pass keeps its barrier. FSR4FG_ALL_BARRIERS=1 keeps them all anyway.
+uint32_t border_joins(Context& c) {
+    if (getenv("FSR4FG_ALL_BARRIERS") && atoi(getenv("FSR4FG_ALL_BARRIERS")) > 0) return 0;
+    const GenBorderSize* size = GEN_BORDER_SIZES;
+    while (size->width && (size->width != c.width || size->height != c.height)) size++;
+    if (!size->width) return 0;
+    uint32_t n = 0;
+    for (Pass& p : c.passes) {
+        const std::string name = "," + std::string(p.gen->entry) + ",";
+        p.joins = strstr(GEN_BORDER_PASSES, name.c_str()) && !strstr(size->keep, name.c_str());
+        n += p.joins;
+    }
+    // (the first pass of the network has no pass before it in the frame to join)
+    if (!c.passes.empty() && c.passes[0].joins) c.passes[0].joins = false, n--;
+    return n;
+}
+
 ffxReturnCode_t create(ffxContext* out, ffxCreateContextDescHeader* header, const ffxAllocationCallbacks* alloc) {
     const auto* desc = (const ffxCreateContextDescFrameGeneration*)find(header, FFX_API_CREATE_CONTEXT_DESC_TYPE_FRAMEGENERATION);
     if (!desc) return FFX_API_RETURN_ERROR_UNKNOWN_DESCTYPE;
@@ -971,6 +1137,8 @@ ffxReturnCode_t create(ffxContext* out, ffxCreateContextDescHeader* header, cons
 
     const GenPass* gen = c->big ? GEN_PASSES_8K : GEN_PASSES_4K;
     const size_t gen_count = c->big ? std::size(GEN_PASSES_8K) : std::size(GEN_PASSES_4K);
+    const auto pipelines_start = std::chrono::steady_clock::now();
+    if (ok) open_cache(*c);
     if (ok) {
         c->passes.resize(gen_count);
         // (the dilate pass's variant by the create flags, as AMD's DLL picks it: traced)
@@ -980,6 +1148,8 @@ ffxReturnCode_t create(ffxContext* out, ffxCreateContextDescHeader* header, cons
              make_pass(*c, c->fwd, GEN_FWDMV, sizeof(CsFwdMv)) && make_pass(*c, c->watermark, GEN_WATERMARK, WATERMARK_BYTES);
         for (size_t i = 0; ok && i < gen_count; i++) ok = make_pass(*c, c->passes[i], gen[i], sizeof(CsFi));
     }
+    close_cache(*c, ok);
+    const double pipelines_ms = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - pipelines_start).count();
     if (ok) {
         uint32_t sets = 2 + 1 + RING + RING, counts[5]{};
         auto tally = [&](const Pass& p, uint32_t n) {
@@ -1022,6 +1192,12 @@ ffxReturnCode_t create(ffxContext* out, ffxCreateContextDescHeader* header, cons
     for (Pass* p : {&c->splat, &c->fwd}) p->groups[0] = c->dilate.groups[0], p->groups[1] = c->dilate.groups[1], p->groups[2] = 1;
     say(false, "context: display %ux%u, network %s (%zu passes), first tensor %ux%u, flow %ux%u, scratch %llu MB", c->width, c->height,
         c->big ? "8k" : "4k", gen_count, c->tensors[0][0], c->tensors[0][1], flow_w, flow_h, (unsigned long long)(c->scratch.size >> 20));
+    const uint32_t joined = border_joins(*c);
+    say(false, "barriers: %u of the network's %zu border passes share the barrier of the pass before them at %ux%u", joined,
+        (size_t)std::count_if(c->passes.begin(), c->passes.end(), [](const Pass& p) { return strstr(GEN_BORDER_PASSES, (","+std::string(p.gen->entry)+",").c_str()); }),
+        c->width, c->height);
+    say(false, "pipelines: %zu made in %.1f ms (pipeline cache %s, %zu bytes given)", gen_count + 4, pipelines_ms,
+        c->cache_file.empty() ? "off" : c->cache_file.c_str(), c->cache_loaded);
     *out = c;
     return FFX_API_RETURN_OK;
 }
@@ -1137,17 +1313,21 @@ ffxReturnCode_t prepare(Context& c, const ffxDispatchDescFrameGenerationPrepareV
     VkDescriptorSet dilate_set = c.dilate.sets[c.slot];
     write_set(c, c.dilate, dilate_set, ext, nullptr, false);
 
+    c.pending_reads = 0, c.pending_writes = D_ALL, c.barriers = 0;
+    const uint64_t splat_cur_r = D_DILATED_MV | D_DILATED_DEPTH, splat_fwd_r = D_FWD_MV | D_PREV_DEPTH;
     run(c, cmd, c.dilate, dilate_set, slot_offset(c, SLOT_DILATE));
-    clear(c, cmd, c.splat_cur);
-    run(c, cmd, c.splat, c.splat_set_cur, slot_offset(c, SLOT_SPLAT_A));
+    clear(c, cmd, c.splat_cur, D_SPLAT_CUR);
+    run(c, cmd, c.splat, c.splat_set_cur, slot_offset(c, SLOT_SPLAT_A), nullptr, splat_cur_r, D_SPLAT_CUR);
     run(c, cmd, c.fwd, c.fwd.sets[0], slot_offset(c, SLOT_FWD));
-    clear(c, cmd, c.splat_fwd);
-    run(c, cmd, c.splat, c.splat_set_fwd, slot_offset(c, SLOT_SPLAT_B));
-    clear(c, cmd, c.splat_cur);
-    run(c, cmd, c.splat, c.splat_set_cur, slot_offset(c, SLOT_SPLAT_C));
-    copy(c, cmd, c.dilated_depth.image, c.prev_depth);
-    copy(c, cmd, c.dilated_mv.image, c.prev_mv);
-    barrier(c, cmd);
+    clear(c, cmd, c.splat_fwd, D_SPLAT_FWD);
+    run(c, cmd, c.splat, c.splat_set_fwd, slot_offset(c, SLOT_SPLAT_B), nullptr, splat_fwd_r, D_SPLAT_FWD);
+    clear(c, cmd, c.splat_cur, D_SPLAT_CUR);
+    run(c, cmd, c.splat, c.splat_set_cur, slot_offset(c, SLOT_SPLAT_C), nullptr, splat_cur_r, D_SPLAT_CUR);
+    copy(c, cmd, c.dilated_depth.image, c.prev_depth, D_DILATED_DEPTH, D_PREV_DEPTH);
+    copy(c, cmd, c.dilated_mv.image, c.prev_mv, D_DILATED_MV, D_PREV_MV);
+    barrier(c, cmd);   // (the caller's motion and depth, and generate's inputs: done before anything after)
+    static bool said_barriers = false;
+    if (!said_barriers) say(false, "prepare: %u barriers", c.barriers), said_barriers = true;
     give_back(c, cmd, motion), give_back(c, cmd, depth);
 
     c.prepared = true, c.prepared_id = d.frameID, c.prepare_reset = d.reset;
@@ -1204,23 +1384,25 @@ ffxReturnCode_t generate(Context& c, const ffxDispatchDescFrameGeneration& d) {
     // and the UI input of the last pass (r_hudless_ui) is the presented colour, HUD and all)
     ext.color = has_hudless ? hudless.view : color.view, ext.output = output.view, ext.hudless = has_hudless ? color.view : VK_NULL_HANDLE;
     const uint32_t offset = slot_offset(c, SLOT_FI);
+    c.pending_reads = 0, c.pending_writes = D_ALL, c.barriers = 0;
     for (Pass& p : c.passes) {
         if (!has_output && std::any_of(p.gen->binds, p.gen->binds + p.gen->bind_count, [](const GenBind& b) { return b.res == RES_OUTPUT; })) continue;
         VkDescriptorSet set = p.sets[p.external ? c.slot : 0];
         if (p.external) write_set(c, p, set, ext, nullptr, false);
         run(c, cmd, p, set, offset);
     }
-    copy(c, cmd, has_hudless ? hudless.image : color.image, c.prev_color);
+    copy(c, cmd, has_hudless ? hudless.image : color.image, c.prev_color, D_CALLER, D_PREV_COLOR);
     if (has_output && (c.config_flags & FFX_FRAMEGENERATION_FLAG_DRAW_DEBUG_VIEW)) {
         // (AMD's 4.0.2 has no debug view: it stamps "MLFI DEBUG VIEW UNSUPPORTED" on the output instead, 82x48 groups
         // whatever the size, traced; the port does the same)
         VkDescriptorSet set = c.watermark.sets[c.slot];
         write_set(c, c.watermark, set, ext, nullptr, false);
-        barrier(c, cmd);
         c.watermark.groups[0] = 82, c.watermark.groups[1] = 48, c.watermark.groups[2] = 1;
         run(c, cmd, c.watermark, set, WATERMARK_OFFSET);
     }
     barrier(c, cmd);
+    static bool said_barriers = false;
+    if (!said_barriers) say(false, "generate: %u barriers", c.barriers), said_barriers = true;
     give_back(c, cmd, color), give_back(c, cmd, output);
     if (has_hudless) give_back(c, cmd, hudless);
     return FFX_API_RETURN_OK;

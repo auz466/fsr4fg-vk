@@ -165,6 +165,18 @@ def main():
     codes = ['A0', 'A1', 'A2', 'A3', 'A4', 'F', 'G', 'G2', 'Gh', 'D']
     out.append('enum TensorRule : uint8_t { %s };' % ', '.join('T_' + c for c in codes))
     out.append('static const TensorRule GEN_TENSOR_RULES[92] = { %s };' % ', '.join('T_' + c for c in MODEL['tensor_sizes']))
+    # (the border passes, and at each display size tools/probe_borders.py probed, those that keep their own barrier: the
+    # rest share the barrier of the pass before them there. Any other display size keeps every barrier.)
+    out.append('// border passes (only zeros to the scratch buffer) and, by display size, the ones that keep their barrier: tools/probe_borders.py')
+    out.append('static const char GEN_BORDER_PASSES[] = ",%s,";' % ','.join(MODEL.get('border_passes', [])))
+    out.append('struct GenBorderSize { uint16_t width, height; const char* keep; };')
+    sizes = sorted(MODEL.get('border_barriers', {}).items(), key=lambda kv: tuple(int(x) for x in kv[0].split('x')))
+    out.append('static const GenBorderSize GEN_BORDER_SIZES[] = {')
+    for size, keep in sizes:
+        w, h = size.split('x')
+        out.append('    {%s, %s, ",%s,"},' % (w, h, ','.join(keep)))
+    out.append('    {0, 0, ""},')
+    out.append('};')
     open(os.path.join(a.out, 'assets_gen.h'), 'w').write('\n'.join(out) + '\n')
     open(os.path.join(a.out, 'assets.bin'), 'wb').write(pack)
     os.remove(os.path.join(a.out, 'check.spv'))

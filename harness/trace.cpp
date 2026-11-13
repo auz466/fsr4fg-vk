@@ -6,6 +6,7 @@
 #include <vulkan/vulkan.h>
 
 #include <algorithm>
+#include <chrono>
 #include <cmath>
 #include <cstdarg>
 #include <cstdint>
@@ -50,7 +51,8 @@
     X(vkCmdDispatchIndirect) X(vkCmdCopyImage) X(vkCmdClearColorImage) X(vkCmdFillBuffer) X(vkCmdPushConstants)        \
     X(vkCreateBufferView) X(vkUnmapMemory) X(vkFlushMappedMemoryRanges) X(vkDestroyImage) X(vkDestroyImageView)        \
     X(vkDestroySampler) X(vkDestroyShaderModule) X(vkDestroyDescriptorSetLayout) X(vkDestroyPipelineLayout)            \
-    X(vkDestroyPipeline) X(vkDestroyDescriptorPool)
+    X(vkDestroyPipeline) X(vkDestroyDescriptorPool) X(vkCreateQueryPool) X(vkCmdResetQueryPool) X(vkCmdWriteTimestamp)     \
+    X(vkGetQueryPoolResults)
 #define DECL(n) static PFN_##n n;
 INSTANCE_FUNCS(DECL)
 DEVICE_FUNCS(DECL)
@@ -58,7 +60,9 @@ static PFN_vkGetInstanceProcAddr vkGetInstanceProcAddr;
 
 static FILE* g_log;
 static std::string g_out;
+static bool g_quiet = false;   // (TRACE_TIMING: no log, so the CPU times are the provider's and not the harness's)
 static void logf(const char* fmt, ...) {
+    if (g_quiet) return;
     va_list a;
     va_start(a, fmt);
     vfprintf(g_log, fmt, a);
@@ -149,6 +153,7 @@ static std::string hex(const void* p, size_t n) {
     return s;
 }
 static void dump_file(const std::string& name, const void* p, size_t n) {
+    if (g_quiet) return;
     FILE* f = fopen((g_out + "/" + name).c_str(), "wb");
     if (!f) die("cannot write %s", name.c_str());
     fwrite(p, 1, n, f);
@@ -163,6 +168,7 @@ static const void* buffer_bytes(uint64_t buffer, VkDeviceSize offset) {
 }
 
 // ---------------------------------------------------------------- the hooks
+static bool probe_dispatch(VkCommandBuffer cb, uint32_t x, uint32_t y, uint32_t z);   // (TRACE_PROBE: below)
 namespace hook {
 // (TRACE_FAIL_AT=n: the provider's n-th object creation fails with VK_ERROR_OUT_OF_DEVICE_MEMORY, to see that it
 // gives up cleanly; g_live: the provider's objects not yet destroyed, logged after its context is destroyed)
@@ -449,6 +455,7 @@ void VKAPI_CALL CmdDispatch(VkCommandBuffer cb, uint32_t x, uint32_t y, uint32_t
     // TRACE_STOP_ENTRY=<entry>: every dispatch after that pass is left out (to compare the scratch buffer at that point)
     if (g_stopped) return;
     describe_bound(cb, "direct", x, y, z);
+    probe_dispatch(cb, x, y, z);
     vkCmdDispatch(cb, x, y, z);
     static const char* stop = getenv("TRACE_STOP_ENTRY");
     auto p = g_pipes.find(g_bound[H(cb)].pipeline);
@@ -504,6 +511,19 @@ void VKAPI_CALL CmdFillBuffer(VkCommandBuffer cb, VkBuffer b, VkDeviceSize off, 
     vkCmdFillBuffer(cb, b, off, size, data);
 }
 void VKAPI_CALL CmdPipelineBarrier(VkCommandBuffer cb, VkPipelineStageFlags ss, VkPipelineStageFlags ds, VkDependencyFlags df, uint32_t nm, const VkMemoryBarrier* m, uint32_t nb, const VkBufferMemoryBarrier* b, uint32_t ni, const VkImageMemoryBarrier* im) {
+    // (every barrier, for 3.4: which dependencies the provider asks for between its passes)
+    logf("BARRIER stages=0x%x->0x%x memory=%u buffers=%u images=%u", ss, ds, nm, nb, ni);
+    for (uint32_t i = 0; i < nm; i++) logf("  memory access=0x%x->0x%x", m[i].srcAccessMask, m[i].dstAccessMask);
+    for (uint32_t i = 0; i < nb; i++) {
+        auto it = g_buffers.find(H(b[i].buffer));
+        logf("  buffer buf%d+%llu size=%lld access=0x%x->0x%x", it == g_buffers.end() ? -1 : it->second.id, (unsigned long long)b[i].offset,
+             (long long)b[i].size, b[i].srcAccessMask, b[i].dstAccessMask);
+    }
+    for (uint32_t i = 0; i < ni; i++) {
+        auto it = g_images.find(H(im[i].image));
+        logf("  image img%d layout=%d->%d access=0x%x->0x%x", it == g_images.end() ? -1 : it->second.id, im[i].oldLayout, im[i].newLayout,
+             im[i].srcAccessMask, im[i].dstAccessMask);
+    }
     for (uint32_t i = 0; i < ni; i++) {
         auto it = g_images.find(H(im[i].image));
         if (it != g_images.end()) it->second.layout = im[i].newLayout;
@@ -540,6 +560,9 @@ VkResult VKAPI_CALL CreateDescriptorPool(VkDevice d, const VkDescriptorPoolCreat
 void VKAPI_CALL DestroyDescriptorPool(VkDevice d, VkDescriptorPool h, const VkAllocationCallbacks* a) { dead(h), vkDestroyDescriptorPool(d, h, a); }
 
 PFN_vkVoidFunction VKAPI_CALL GetDeviceProcAddr(VkDevice d, const char* name) {
+    // (timing: the provider gets the driver's own functions, but for the shader module hook that swaps in the rewritten
+    // shaders AMD's DLL needs, so the CPU times are the provider's and the GPU runs the same work as when traced)
+    if (g_quiet && strcmp(name, "vkCreateShaderModule") != 0) return vkGetDeviceProcAddr(d, name);
 #define HOOK(n) \
     if (!strcmp(name, "vk" #n)) return (PFN_vkVoidFunction)n;
     HOOK(CreateBuffer) HOOK(CreateImage) HOOK(CreateImageView) HOOK(CreateSampler) HOOK(CreateShaderModule)
@@ -625,6 +648,174 @@ static void submit() {
     si.commandBufferCount = 1, si.pCommandBuffers = &g_cmd;
     if (VkResult r = vkQueueSubmit(g_queue, 1, &si, VK_NULL_HANDLE)) die("submit %d", r);
     if (VkResult r = vkQueueWaitIdle(g_queue)) die("wait idle %d (device lost?)", r);
+}
+
+// ---------------------------------------------------------------- TRACE_PROBE: which network passes depend on which
+// TRACE_PROBE=<frame> TRACE_PROBE_ZERO=<entries>: in that frame, at each pass named in TRACE_PROBE_ZERO (the passes that
+// only write zeros to the scratch buffer, the tensors' borders: tools/probe_borders.py lists them) the work recorded so
+// far is run, and that pass and the last pass before it that is not one of them (c) are run alone on chosen scratch
+// contents, then the real contents are put back and recording goes on. Logged, one line a pair (PROBE ...):
+//   wz     words the zero pass writes (scratch all ones before: what becomes zero)
+//   wc     words c writes (scratch in two different patterns of moderate numbers: what differs from either)
+//   waw    words both write; waw_nonzero: of those, how many c writes as anything but zero (in any of the four runs of c
+//          above and below): where it writes zeros there too, the order of the two makes no difference
+//   infl   words of c's output, outside wz, that differ when the zero pass runs before c (real contents; and random
+//          contents of moderate numbers): c reads what the zero pass writes
+// The pair may run with no barrier between them only if waw_nonzero and both infl are 0. c must write no image (else skipped).
+static std::string g_probe_zero;
+static int g_probe_frame = -1, g_frame_now = -1;
+struct Recorded {
+    uint64_t pipeline = 0;
+    std::vector<uint64_t> sets;
+    std::vector<uint32_t> dynamic;
+    uint32_t groups[3]{};
+    std::string entry;
+    bool writes_image = false;
+    VkBuffer scratch = VK_NULL_HANDLE;
+    VkDeviceSize scratch_size = 0;
+};
+static Recorded g_last_work;
+static Recorded recorded(VkCommandBuffer cb, uint32_t x, uint32_t y, uint32_t z) {
+    Recorded r;
+    hook::Bound& b = hook::g_bound[H(cb)];
+    r.pipeline = b.pipeline, r.sets = b.sets, r.dynamic = b.dynamic, r.groups[0] = x, r.groups[1] = y, r.groups[2] = z;
+    auto p = g_pipes.find(b.pipeline);
+    r.entry = p == g_pipes.end() ? "?" : p->second.entry;
+    for (uint64_t set : b.sets)
+        for (auto& [key, w] : g_setwrites[set]) {
+            if (w.type == VK_DESCRIPTOR_TYPE_STORAGE_IMAGE) r.writes_image = true;
+            if (w.type == VK_DESCRIPTOR_TYPE_STORAGE_BUFFER && key / 1000 == 128) {
+                r.scratch = (VkBuffer)w.a;
+                r.scratch_size = g_buffers[w.a].size;
+            }
+        }
+    return r;
+}
+static void full_barrier(VkCommandBuffer cb) {
+    VkMemoryBarrier m{VK_STRUCTURE_TYPE_MEMORY_BARRIER};
+    m.srcAccessMask = m.dstAccessMask = VK_ACCESS_MEMORY_READ_BIT | VK_ACCESS_MEMORY_WRITE_BIT;
+    vkCmdPipelineBarrier(cb, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, 0, 1, &m, 0, nullptr, 0, nullptr);
+}
+static void replay(VkCommandBuffer cb, const Recorded& r) {
+    vkCmdBindPipeline(cb, VK_PIPELINE_BIND_POINT_COMPUTE, (VkPipeline)r.pipeline);
+    std::vector<VkDescriptorSet> sets;
+    for (uint64_t s : r.sets) sets.push_back((VkDescriptorSet)s);
+    vkCmdBindDescriptorSets(cb, VK_PIPELINE_BIND_POINT_COMPUTE, (VkPipelineLayout)g_pipes[r.pipeline].layout, 0, (uint32_t)sets.size(), sets.data(),
+                            (uint32_t)r.dynamic.size(), r.dynamic.data());
+    vkCmdDispatch(cb, r.groups[0], r.groups[1], r.groups[2]);
+    full_barrier(cb);
+}
+static bool probe_dispatch(VkCommandBuffer cb, uint32_t x, uint32_t y, uint32_t z) {
+    if (g_frame_now != g_probe_frame || cb != g_cmd) return false;
+    Recorded now = recorded(cb, x, y, z);
+    if (now.entry.compare(0, 5, "mlfi_") != 0 || !now.scratch) return false;
+    const bool zero = ("," + g_probe_zero + ",").find("," + now.entry + ",") != std::string::npos;
+    if (!zero) { g_last_work = now; return false; }
+    const Recorded& c = g_last_work;
+    if (c.entry.empty() || c.scratch != now.scratch) return false;
+    if (c.writes_image) { logf("PROBE %s after %s: skipped (it writes an image)", now.entry.c_str(), c.entry.c_str()); fprintf(stderr, "PROBE %s skipped\n", now.entry.c_str()); return false; }
+    const VkDeviceSize size = now.scratch_size;
+    const size_t words = (size_t)(size / 4);
+    // run what was recorded so far
+    vkEndCommandBuffer(g_cmd);
+    VkSubmitInfo si{VK_STRUCTURE_TYPE_SUBMIT_INFO};
+    si.commandBufferCount = 1, si.pCommandBuffers = &g_cmd;
+    if (vkQueueSubmit(g_queue, 1, &si, VK_NULL_HANDLE) || vkQueueWaitIdle(g_queue)) die("probe: submit");
+    // the buffers of the probe, made once
+    static VkBuffer saved = VK_NULL_HANDLE, host = VK_NULL_HANDLE;
+    static void* host_map = nullptr;
+    static std::vector<uint32_t> random_words;
+    if (!saved) {
+        auto make = [&](VkBuffer& b, VkMemoryPropertyFlags want, void** map) {
+            VkBufferCreateInfo ci{VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO};
+            ci.size = size, ci.usage = VK_BUFFER_USAGE_TRANSFER_SRC_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT;
+            if (vkCreateBuffer(g_device, &ci, nullptr, &b)) die("probe buffer");
+            VkMemoryRequirements mr;
+            vkGetBufferMemoryRequirements(g_device, b, &mr);
+            VkMemoryAllocateInfo ai{VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO};
+            ai.allocationSize = mr.size, ai.memoryTypeIndex = memory_type(mr.memoryTypeBits, want);
+            VkDeviceMemory m;
+            if (vkAllocateMemory(g_device, &ai, nullptr, &m)) die("probe memory");
+            vkBindBufferMemory(g_device, b, m, 0);
+            if (map) vkMapMemory(g_device, m, 0, VK_WHOLE_SIZE, 0, map);
+        };
+        make(saved, VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT, nullptr);
+        make(host, VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT | VK_MEMORY_PROPERTY_HOST_CACHED_BIT, &host_map);
+        // (moderate numbers in every format the network uses: each byte 0x30..0x3f)
+        random_words.resize(words);
+        uint32_t st = 12345;
+        for (auto& w : random_words) {
+            w = 0;
+            for (int k = 0; k < 4; k++) st = st * 1664525u + 1013904223u, w |= (0x30u | (st >> 28)) << (8 * k);
+        }
+    }
+    VkCommandBuffer& pc = g_cmd;   // (the harness's own command buffer, reused between submissions)
+    auto begin_ = [&]() {
+        vkResetCommandBuffer(pc, 0);
+        VkCommandBufferBeginInfo bi{VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO};
+        vkBeginCommandBuffer(pc, &bi);
+    };
+    auto end_ = [&]() {
+        vkEndCommandBuffer(pc);
+        if (vkQueueSubmit(g_queue, 1, &si, VK_NULL_HANDLE) || vkQueueWaitIdle(g_queue)) die("probe: submit");
+    };
+    auto copy_ = [&](VkBuffer from, VkBuffer to) {
+        VkBufferCopy r{0, 0, size};
+        vkCmdCopyBuffer(pc, from, to, 1, &r);
+        full_barrier(pc);
+    };
+    auto fill_ = [&](uint32_t v) { vkCmdFillBuffer(pc, now.scratch, 0, size, v); full_barrier(pc); };
+    auto upload_random = [&]() { memcpy(host_map, random_words.data(), (size_t)size); copy_(host, now.scratch); };
+    // (each step: set the scratch buffer, run passes, read it back)
+    auto step = [&](auto&& set, std::initializer_list<const Recorded*> passes) {
+        begin_();
+        set();
+        for (const Recorded* r : passes) replay(pc, *r);
+        copy_(now.scratch, host);
+        end_();
+        return std::vector<uint32_t>((const uint32_t*)host_map, (const uint32_t*)host_map + words);
+    };
+    begin_(), copy_(now.scratch, saved), end_();
+    auto from_saved = [&]() { copy_(saved, now.scratch); };
+    const std::vector<uint32_t> z1 = step([&] { fill_(0xffffffffu); }, {&now});
+    std::vector<uint8_t> wz(words), wc(words);
+    size_t n_wz = 0, n_wc = 0, n_waw = 0, notzero = 0, waw_nonzero = 0;
+    for (size_t i = 0; i < words; i++) {
+        if (z1[i] == 0) wz[i] = 1, n_wz++;
+        else if (z1[i] != 0xffffffffu) notzero++;
+    }
+    {
+        // (two different patterns of moderate numbers, not uniform fills: a pass that copies within the scratch buffer
+        // would write a uniform fill's own value back)
+        const std::vector<uint32_t> a = step(upload_random, {&c});
+        for (auto& w : random_words) w ^= 0x0f0f0f0fu;
+        const std::vector<uint32_t> b = step(upload_random, {&c});
+        for (auto& w : random_words) w ^= 0x0f0f0f0fu;
+        for (size_t i = 0; i < words; i++)
+            if (a[i] != random_words[i] || b[i] != (random_words[i] ^ 0x0f0f0f0fu)) wc[i] = 1, n_wc++, n_waw += wz[i], waw_nonzero += wz[i] && (a[i] || b[i]);
+    }
+    auto influence = [&](auto&& set) {
+        const std::vector<uint32_t> o1 = step(set, {&c});
+        const std::vector<uint32_t> o2 = step(set, {&now, &c});
+        size_t n = 0;
+        for (size_t i = 0; i < words; i++) n += wc[i] && !wz[i] && o1[i] != o2[i], waw_nonzero += wc[i] && wz[i] && o1[i];
+        return n;
+    };
+    const size_t infl_real = influence(from_saved), infl_random = influence(upload_random);
+    begin_(), from_saved(), end_();   // (the real contents back)
+    logf("PROBE %s after %s: wz=%zu wc=%zu waw=%zu waw_nonzero=%zu infl_real=%zu infl_random=%zu notzero=%zu", now.entry.c_str(), c.entry.c_str(), n_wz, n_wc,
+         n_waw, waw_nonzero, infl_real, infl_random, notzero);
+    fprintf(stderr, "PROBE %s after %s: wz=%zu wc=%zu waw=%zu waw_nonzero=%zu infl_real=%zu infl_random=%zu notzero=%zu\n", now.entry.c_str(), c.entry.c_str(),
+            n_wz, n_wc, n_waw, waw_nonzero, infl_real, infl_random, notzero);
+    // go on recording where the frame was: the pass's own state bound again
+    begin_();
+    full_barrier(pc);
+    vkCmdBindPipeline(pc, VK_PIPELINE_BIND_POINT_COMPUTE, (VkPipeline)now.pipeline);
+    std::vector<VkDescriptorSet> sets;
+    for (uint64_t s2 : now.sets) sets.push_back((VkDescriptorSet)s2);
+    vkCmdBindDescriptorSets(pc, VK_PIPELINE_BIND_POINT_COMPUTE, (VkPipelineLayout)g_pipes[now.pipeline].layout, 0, (uint32_t)sets.size(), sets.data(),
+                            (uint32_t)now.dynamic.size(), now.dynamic.data());
+    return true;
 }
 static void to_layout(VkImage im, VkImageLayout to, uint32_t mips = 1) {
     ImageInfo& info = g_images[H(im)];
@@ -941,6 +1132,13 @@ int main(int argc, char** argv) {
 #endif
     g_log = fopen((g_out + "/trace.log").c_str(), "w");
     if (!g_log) die("cannot write to %s", g_out.c_str());
+    // TRACE_TIMING=1: GPU timestamps around prepare and generate, and CPU times of create and the dispatch calls, one line
+    // a frame to <out>/timing.txt; no log or dumps (so the CPU times are the provider's own)
+    const bool timing = getenv("TRACE_TIMING") && atoi(getenv("TRACE_TIMING")) > 0;
+    g_quiet = timing;
+    if (const char* pf = getenv("TRACE_PROBE")) g_probe_frame = atoi(pf), g_probe_zero = getenv("TRACE_PROBE_ZERO") ? getenv("TRACE_PROBE_ZERO") : "";
+    using Clock = std::chrono::steady_clock;
+    auto ms_since = [](Clock::time_point t) { return std::chrono::duration<double, std::milli>(Clock::now() - t).count(); };
 
 #ifdef _WIN32
     void* vk = load_lib("vulkan-1.dll");
@@ -1125,7 +1323,9 @@ int main(int argc, char** argv) {
     logf("=== create context display=%ux%u render=%ux%u flags=0x%x format=%d", W, Hh, RW, RH, cc.flags, color_format);
     ffxAllocationCallbacks counting{nullptr, count_alloc, count_free};
     const ffxAllocationCallbacks* callbacks = getenv("TRACE_ALLOC") ? &counting : nullptr;
+    const Clock::time_point create_start = Clock::now();
     r = create(&ctx, &cc.header, callbacks);
+    const double create_ms = ms_since(create_start);
     logf("=== create context -> %u ctx=%p", r, ctx);
     fprintf(stderr, "create context -> %u\n", r);
     if (r != FFX_API_RETURN_OK || !ctx) {
@@ -1150,6 +1350,19 @@ int main(int argc, char** argv) {
         fprintf(stderr, "in use: %s\n", pv.versionName ? pv.versionName : "?");
     }
 
+    FILE* timing_out = nullptr;
+    VkQueryPool queries = VK_NULL_HANDLE;
+    if (timing) {
+        if (!props.limits.timestampComputeAndGraphics) die("TRACE_TIMING: the device has no timestamps on this queue");
+        VkQueryPoolCreateInfo qi{VK_STRUCTURE_TYPE_QUERY_POOL_CREATE_INFO};
+        qi.queryType = VK_QUERY_TYPE_TIMESTAMP, qi.queryCount = 3;
+        if (VkResult qr = vkCreateQueryPool(g_device, &qi, nullptr, &queries)) die("query pool %d", qr);
+        timing_out = fopen((g_out + "/timing.txt").c_str(), "w");
+        if (!timing_out) die("cannot write timing.txt");
+        fprintf(timing_out, "# GPU %s, display %ux%u, render %ux%u\n# create_ms %.3f\n# frame prepare_gpu_ms generate_gpu_ms prepare_cpu_ms generate_cpu_ms\n",
+                props.deviceName, W, Hh, RW, RH, create_ms);
+        fprintf(stderr, "create: %.1f ms (CPU)\n", create_ms);
+    }
     VkImage color = our_image(color_format, W, Hh, "in_color");
     VkImage depth = our_image(VK_FORMAT_R32_SFLOAT, RW, RH, "in_depth");
     const bool display_mv = (cc.flags & FFX_FRAMEGENERATION_ENABLE_DISPLAY_RESOLUTION_MOTION_VECTORS) != 0;
@@ -1203,6 +1416,7 @@ int main(int argc, char** argv) {
         upload(depth, scene.depth.data(), scene.depth.size() * 4);
         upload(motion, scene.motion.data(), scene.motion.size() * 2);
         logf("=== FRAME %d", frame);
+        g_frame_now = frame;
         // (TRACE_IDS=a,b,c...: the frame IDs to use, frame by frame, to skip or repeat; otherwise 100, 101, ...)
         uint64_t id = 100 + frame;
         if (const char* ids = getenv("TRACE_IDS")) {
@@ -1230,6 +1444,10 @@ int main(int argc, char** argv) {
             logf("=== configure distortion -> %u", r);
         }
         begin();
+        if (timing) {
+            vkCmdResetQueryPool(g_cmd, queries, 0, 3);
+            vkCmdWriteTimestamp(g_cmd, VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT, queries, 0);
+        }
         ffxDispatchDescFrameGenerationPrepareV2 prep{};
         prep.header.type = FFX_API_DISPATCH_DESC_TYPE_FRAMEGENERATION_PREPARE_V2;
         prep.frameID = id, prep.commandList = (void*)g_cmd;
@@ -1258,7 +1476,10 @@ int main(int argc, char** argv) {
                  prep.frameTimeDelta, prep.viewSpaceToMetersFactor);
         }
         logf("=== dispatch prepare");
+        Clock::time_point cpu_start = Clock::now();
         r = dispatch(&ctx, &prep.header);
+        const double prepare_cpu_ms = ms_since(cpu_start);
+        if (timing) vkCmdWriteTimestamp(g_cmd, VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT, queries, 1);
         logf("=== dispatch prepare -> %u", r);
         ffxDispatchDescFrameGeneration fg{};
         fg.header.type = FFX_API_DISPATCH_DESC_TYPE_FRAMEGENERATION;
@@ -1278,24 +1499,37 @@ int main(int argc, char** argv) {
         fg.generationRect = cfg.generationRect;
         fg.frameID = id;
         logf("=== dispatch generate");
+        cpu_start = Clock::now();
         r = dispatch(&ctx, &fg.header);
+        const double generate_cpu_ms = ms_since(cpu_start);
+        if (timing) vkCmdWriteTimestamp(g_cmd, VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT, queries, 2);
         logf("=== dispatch generate -> %u", r);
-        fprintf(stderr, "frame %d: generate -> %u, %d dispatches so far\n", frame, r, g_dispatch);
+        if (!timing) fprintf(stderr, "frame %d: generate -> %u, %d dispatches so far\n", frame, r, g_dispatch);
         submit();
+        if (timing) {
+            uint64_t t[3];
+            if (VkResult qr = vkGetQueryPoolResults(g_device, queries, 0, 3, sizeof t, t, sizeof t[0], VK_QUERY_RESULT_64_BIT | VK_QUERY_RESULT_WAIT_BIT))
+                die("query results %d", qr);
+            const uint64_t mask = qf[family].timestampValidBits < 64 ? (1ull << qf[family].timestampValidBits) - 1 : ~0ull;
+            const double tick = props.limits.timestampPeriod * 1e-6;
+            fprintf(timing_out, "%d %.4f %.4f %.4f %.4f\n", frame, (double)((t[1] - t[0]) & mask) * tick, (double)((t[2] - t[1]) & mask) * tick,
+                    prepare_cpu_ms, generate_cpu_ms);
+        }
         logf("=== frame %d submitted and finished", frame);
-        if (frame >= dump_from) {
+        if (!timing && frame >= dump_from) {
             char prefix[32];
             snprintf(prefix, sizeof prefix, "f%d", frame);
             dump_images(prefix, !getenv("TRACE_DUMP_ALL") || !*getenv("TRACE_DUMP_ALL"));   // (unset or empty: only the harness's own images)
             if (getenv("TRACE_DUMP_BUFFERS")) dump_buffers(prefix, (VkDeviceSize)atoll(getenv("TRACE_DUMP_BUFFERS")));
         }
     }
+    if (timing_out) fclose(timing_out);
     memory_v1("after the frames");
     vkDeviceWaitIdle(g_device);
     r = destroy(&ctx, callbacks);
     logf("=== destroy -> %u", r);
     logf("LIVE %zu of the provider's objects left after destroy", hook::g_live.size());
-    fprintf(stderr, "provider objects left after destroy: %zu\n", hook::g_live.size());
+    if (!timing) fprintf(stderr, "provider objects left after destroy: %zu\n", hook::g_live.size());   // (timing: not counted)
     if (callbacks) {
         logf("ALLOC allocations=%d frees=%d", g_allocs, g_frees);
         fprintf(stderr, "allocation callbacks: %d allocations, %d frees\n", g_allocs, g_frees);
