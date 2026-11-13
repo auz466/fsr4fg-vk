@@ -4,7 +4,8 @@
 // the same FSR API entry points (ffxCreateContext, ffxConfigure, ffxQuery, ffxDispatch, ffxDestroyContext) and records the
 // same compute passes over the same shaders and model weights, which tools/setup.py takes out of AMD's DLL at build time.
 // What the passes are, in what order, over which images, with which constants, was read off AMD's DLL at work (harness/
-// trace.cpp): nothing here is AMD's code.
+// trace.cpp). The one piece adapted from AMD's code is the V2 memory estimate (fsr3_memory_usage_v2: AMD's open FSR 3
+// sources, MIT, THIRD_PARTY_NOTICES.md).
 //
 // A frame is two dispatches, as AMD's documentation orders them:
 //   prepare  (ffxDispatchDescFrameGenerationPrepareV2): the game's motion and depth dilated to a third of the display
@@ -12,8 +13,20 @@
 //   generate (ffxDispatchDescFrameGeneration): the network, 175 passes over one scratch buffer. It reads the previous and
 //            the current picture, estimates the flow to the midpoint, and writes the picture in between.
 //
-// Not done: AMD's swapchain and pacing (the caller presents), more than one made frame an interval, HUD-less colour,
-// distortion fields, the debug overlays other than the tear lines' colour.
+// The device must support, and the caller must have enabled on its VkDevice: Vulkan 1.3; VK_KHR_cooperative_matrix
+// (cooperativeMatrix); VK_EXT_shader_float8 (shaderFloat8, shaderFloat8CooperativeMatrix); VK_EXT_shader_image_atomic_int64
+// (shaderImageInt64Atomics); shaderInt64, shaderInt8, shaderFloat16, vulkanMemoryModel, variablePointers(StorageBuffer),
+// shaderStorageImageWriteWithoutFormat; subgroupSizeControl with 32-wide compute subgroups. A device without them gets no
+// provider (GET_VERSIONS lists none, create returns NO_PROVIDER), as AMD's DLL does for its 4.0.2.
+//
+// Threads: one context is single-threaded, as AMD's is (the caller serialises its calls on it). Separate contexts share
+// nothing but the global debug callback, which is guarded, and may be used from separate threads.
+// Frames in flight: up to RING - 1 = 15 frames of one context's work may be on the GPU unfinished. ffxDestroyContext
+// does not wait for the GPU: the caller must have finished the work that used the context.
+// Host memory: the context itself comes from the caller's ffxAllocationCallbacks when given.
+//
+// Not done: AMD's swapchain and pacing (the caller presents; workstream 3.5), the FSR 3 provider AMD's DLL also
+// carries, ENABLE_ASYNC_WORKLOAD_SUPPORT.
 #include <vulkan/vulkan.h>
 
 #include <algorithm>
@@ -25,6 +38,8 @@
 #include <cstring>
 #include <memory>
 #include <mutex>
+#include <new>
+#include <string>
 #include <vector>
 
 #include <dlfcn.h>
@@ -44,17 +59,29 @@ namespace {
 
 constexpr uint64_t VERSION_ID = 0xf600000001000002ull;   // (AMD's id for 4.0.2, so a version override naming it lands here)
 constexpr const char* VERSION_NAME = "4.0.2 (fsr4fg-vk)";
-constexpr uint32_t RING = 8;        // frames a descriptor set or constants slot is left alone before it is written again
+// Frames a descriptor set, constants slot or view of the caller's images is left alone before it is reused: the caller
+// may have up to RING - 1 frames of this context's work in flight on the GPU (submitted, not finished). AMD's DLL
+// reuses its constants after 12 (traced: 258,256 bytes a frame in a 3,276,800-byte ring), so 16 is at least as safe.
+constexpr uint32_t RING = 16;
 constexpr uint32_t TENSOR_BYTES = 92 * 16;
 
 // ---------------------------------------------------------------- logging
+// (the callback of ffxConfigureDescGlobalDebug: process-wide, as AMD's is; set and read under g_message_mu, since
+// separate contexts may be used from separate threads)
 ffxApiMessage g_message = nullptr;
 uint32_t g_message_level = 0;
+std::mutex g_message_mu;
 
 void say(bool error, const char* fmt, ...) {
     static const char* path = getenv("FSR4FG_LOG");
     static const bool verbose = getenv("FSR4FG_VERBOSE") != nullptr;
-    if (!error && !verbose && !path && !g_message) return;
+    ffxApiMessage message;
+    uint32_t level;
+    {
+        std::lock_guard lock(g_message_mu);
+        message = g_message, level = g_message_level;
+    }
+    if (!error && !verbose && !path && !message) return;
     char text[1024];
     va_list a;
     va_start(a, fmt);
@@ -66,12 +93,12 @@ void say(bool error, const char* fmt, ...) {
         std::lock_guard lock(mu);
         if (FILE* f = fopen(path, "a")) fprintf(f, "%s\n", text), fclose(f);
     }
-    if (g_message && (error || g_message_level > 1)) {
+    if (message && (error || level > 1)) {
         wchar_t wide[1024];
         size_t i = 0;
         for (; text[i] && i < 1023; i++) wide[i] = (unsigned char)text[i];
         wide[i] = 0;
-        g_message(error ? FFX_API_MESSAGE_TYPE_ERROR : FFX_API_MESSAGE_TYPE_WARNING, wide);
+        message(error ? FFX_API_MESSAGE_TYPE_ERROR : FFX_API_MESSAGE_TYPE_WARNING, wide);
     }
 }
 
@@ -223,6 +250,7 @@ enum : uint32_t { SLOT_DILATE = 0, SLOT_SPLAT_A = 256, SLOT_FWD = 512, SLOT_SPLA
 constexpr uint32_t WATERMARK_OFFSET = SLOT_BYTES * (RING + 1), WATERMARK_BYTES = 736;
 
 struct Context {
+    ffxAllocationCallbacks alloc{};   // (the callbacks it was made with: the context itself came from them)
     Vk vk;
     VkDevice device = VK_NULL_HANDLE;
     VkPhysicalDevice physical = VK_NULL_HANDLE;
@@ -734,6 +762,22 @@ void give_back(Context& c, VkCommandBuffer cmd, const Borrowed& b) {
 }
 
 // ---------------------------------------------------------------- create and destroy
+/// The context's own memory, from the caller's ffxAllocationCallbacks when given (kept for its destruction), else the
+/// C++ heap. (Its vectors still use the C++ heap: they are small, and sized at create.)
+Context* new_context(const ffxAllocationCallbacks* a) {
+    void* mem = a && a->alloc ? a->alloc(a->pUserData, sizeof(Context)) : ::operator new(sizeof(Context), std::nothrow);
+    if (!mem) return nullptr;
+    Context* c = new (mem) Context;
+    if (a && a->alloc) c->alloc = *a;
+    return c;
+}
+void free_context(Context* c) {
+    const ffxAllocationCallbacks a = c->alloc;
+    c->~Context();
+    if (a.alloc) {
+        if (a.dealloc) a.dealloc(a.pUserData, c);
+    } else ::operator delete(c);
+}
 void destroy(Context* c) {
     if (!c) return;
     if (c->device) {
@@ -748,7 +792,7 @@ void destroy(Context* c) {
             drop_image(*c, *im);
         for (Buffer* b : {&c->scratch, &c->weights, &c->weights_staging, &c->ubo}) drop_buffer(*c, *b);
     }
-    delete c;
+    free_context(c);
 }
 
 const ffxApiHeader* find(const ffxApiHeader* h, uint64_t type) {
@@ -757,7 +801,59 @@ const ffxApiHeader* find(const ffxApiHeader* h, uint64_t type) {
     return nullptr;
 }
 
-ffxReturnCode_t create(ffxContext* out, ffxCreateContextDescHeader* header) {
+/// What the device lacks of what AMD's shaders need (from the capabilities and extensions they declare), as a list for
+/// a message; empty when it has it all. Only support can be checked: the caller must also have enabled these features
+/// on its VkDevice (VkPhysicalDeviceFeatures2 chain at vkCreateDevice), which Vulkan gives no way to ask afterwards; a
+/// pipeline that then fails to build turns into ERROR_RUNTIME_ERROR at create. Not checked: SPV_NV_cooperative_matrix2's
+/// conversions, which AMD's shaders also declare and RADV compiles without advertising the extension.
+std::string missing_features(VkPhysicalDevice phys) {
+    void* loader = dlopen("libvulkan.so.1", RTLD_NOW | RTLD_NOLOAD);
+    if (!loader) loader = dlopen("libvulkan.so.1", RTLD_NOW);
+    const auto features2 = loader ? (PFN_vkGetPhysicalDeviceFeatures2)dlsym(loader, "vkGetPhysicalDeviceFeatures2") : nullptr;
+    const auto properties2 = loader ? (PFN_vkGetPhysicalDeviceProperties2)dlsym(loader, "vkGetPhysicalDeviceProperties2") : nullptr;
+    const auto extensions = loader ? (PFN_vkEnumerateDeviceExtensionProperties)dlsym(loader, "vkEnumerateDeviceExtensionProperties") : nullptr;
+    if (!features2 || !properties2 || !extensions) return "the Vulkan loader's physical device functions";
+    uint32_t n = 0;
+    extensions(phys, nullptr, &n, nullptr);
+    std::vector<VkExtensionProperties> ext(n);
+    extensions(phys, nullptr, &n, ext.data());
+    auto has = [&](const char* e) { return std::any_of(ext.begin(), ext.end(), [&](const VkExtensionProperties& x) { return !strcmp(x.extensionName, e); }); };
+    std::string missing;
+    auto need = [&](bool ok, const char* what) { if (!ok) missing += (missing.empty() ? "" : ", ") + std::string(what); };
+    const bool coop = has(VK_KHR_COOPERATIVE_MATRIX_EXTENSION_NAME), fp8 = has(VK_EXT_SHADER_FLOAT8_EXTENSION_NAME),
+               i64 = has(VK_EXT_SHADER_IMAGE_ATOMIC_INT64_EXTENSION_NAME);
+    need(coop, VK_KHR_COOPERATIVE_MATRIX_EXTENSION_NAME), need(fp8, VK_EXT_SHADER_FLOAT8_EXTENSION_NAME), need(i64, VK_EXT_SHADER_IMAGE_ATOMIC_INT64_EXTENSION_NAME);
+    VkPhysicalDeviceFeatures2 f{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FEATURES_2};
+    VkPhysicalDeviceVulkan11Features f11{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_1_FEATURES};
+    VkPhysicalDeviceVulkan12Features f12{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_2_FEATURES};
+    VkPhysicalDeviceVulkan13Features f13{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_3_FEATURES};
+    VkPhysicalDeviceCooperativeMatrixFeaturesKHR fc{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_COOPERATIVE_MATRIX_FEATURES_KHR};
+    VkPhysicalDeviceShaderFloat8FeaturesEXT f8{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SHADER_FLOAT8_FEATURES_EXT};
+    VkPhysicalDeviceShaderImageAtomicInt64FeaturesEXT fi{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SHADER_IMAGE_ATOMIC_INT64_FEATURES_EXT};
+    f.pNext = &f11, f11.pNext = &f12, f12.pNext = &f13;
+    void** tail = &f13.pNext;   // (only the extensions the device has may be chained)
+    if (coop) *tail = &fc, tail = &fc.pNext;
+    if (fp8) *tail = &f8, tail = &f8.pNext;
+    if (i64) *tail = &fi, tail = &fi.pNext;
+    features2(phys, &f);
+    VkPhysicalDeviceProperties2 p{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PROPERTIES_2};
+    VkPhysicalDeviceVulkan13Properties p13{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_3_PROPERTIES};
+    p.pNext = &p13;
+    properties2(phys, &p);
+    need(p.properties.apiVersion >= VK_API_VERSION_1_3, "Vulkan 1.3");
+    if (coop) need(fc.cooperativeMatrix, "cooperativeMatrix");
+    if (fp8) need(f8.shaderFloat8, "shaderFloat8"), need(f8.shaderFloat8CooperativeMatrix, "shaderFloat8CooperativeMatrix");
+    if (i64) need(fi.shaderImageInt64Atomics, "shaderImageInt64Atomics");
+    need(f.features.shaderInt64, "shaderInt64"), need(f.features.shaderStorageImageWriteWithoutFormat, "shaderStorageImageWriteWithoutFormat");
+    need(f12.shaderFloat16, "shaderFloat16"), need(f12.shaderInt8, "shaderInt8"), need(f12.vulkanMemoryModel, "vulkanMemoryModel");
+    need(f11.variablePointers && f11.variablePointersStorageBuffer, "variablePointers");
+    need(f13.subgroupSizeControl && p13.minSubgroupSize <= 32 && p13.maxSubgroupSize >= 32 &&
+             (p13.requiredSubgroupSizeStages & VK_SHADER_STAGE_COMPUTE_BIT),
+         "subgroupSizeControl with 32-wide compute subgroups");
+    return missing;
+}
+
+ffxReturnCode_t create(ffxContext* out, ffxCreateContextDescHeader* header, const ffxAllocationCallbacks* alloc) {
     const auto* desc = (const ffxCreateContextDescFrameGeneration*)find(header, FFX_API_CREATE_CONTEXT_DESC_TYPE_FRAMEGENERATION);
     if (!desc) return FFX_API_RETURN_ERROR_UNKNOWN_DESCTYPE;
     // (the backend description: AMD's current one and the one it replaced lay out the same three members)
@@ -769,6 +865,11 @@ ffxReturnCode_t create(ffxContext* out, ffxCreateContextDescHeader* header) {
     }
     const VkDeviceContext& dc = ((const ffxCreateBackendVKDesc*)bh)->deviceContext;
     if (!dc.vkDevice || !dc.vkPhysicalDevice || !dc.vkDeviceProcAddr) return FFX_API_RETURN_ERROR_PARAMETER;
+    // (as AMD's DLL, traced on a device without cooperative matrices: no 4.0.2 provider, so NO_PROVIDER)
+    if (const std::string missing = missing_features(dc.vkPhysicalDevice); !missing.empty()) {
+        say(true, "this device cannot run FSR Frame Generation 4.0.2: it lacks %s", missing.c_str());
+        return FFX_API_RETURN_NO_PROVIDER;
+    }
     if (const auto* ov = (const ffxOverrideVersion*)find(header, FFX_API_DESC_TYPE_OVERRIDE_VERSION); ov && ov->versionId != VERSION_ID) {
         say(true, "version 0x%llx was asked for: this library is only %s", (unsigned long long)ov->versionId, VERSION_NAME);
         return FFX_API_RETURN_NO_PROVIDER;
@@ -780,13 +881,14 @@ ffxReturnCode_t create(ffxContext* out, ffxCreateContextDescHeader* header) {
     if (desc->flags & FFX_FRAMEGENERATION_ENABLE_ASYNC_WORKLOAD_SUPPORT) say(true, "ENABLE_ASYNC_WORKLOAD_SUPPORT is not implemented and is ignored");
 
 
-    Context* c = new Context;
+    Context* c = new_context(alloc);
+    if (!c) return FFX_API_RETURN_ERROR_MEMORY;
     c->device = dc.vkDevice, c->physical = dc.vkPhysicalDevice;
 #define LOAD(n) c->vk.n = (PFN_vk##n)dc.vkDeviceProcAddr(c->device, "vk" #n);
     DEVICE_FUNCS(LOAD)
 #undef LOAD
 #define CHECK(n) \
-    if (!c->vk.n) { say(true, "the device has no vk" #n); delete c; return FFX_API_RETURN_ERROR_RUNTIME_ERROR; }
+    if (!c->vk.n) { say(true, "the device has no vk" #n); free_context(c); return FFX_API_RETURN_ERROR_RUNTIME_ERROR; }
     DEVICE_FUNCS(CHECK)
 #undef CHECK
     // (the one instance-level call: from the Vulkan loader the caller's device came through)
@@ -795,7 +897,7 @@ ffxReturnCode_t create(ffxContext* out, ffxCreateContextDescHeader* header) {
     auto memory_properties = loader ? (PFN_vkGetPhysicalDeviceMemoryProperties)dlsym(loader, "vkGetPhysicalDeviceMemoryProperties") : nullptr;
     if (!memory_properties) {
         say(true, "no vkGetPhysicalDeviceMemoryProperties in libvulkan.so.1");
-        delete c;
+        free_context(c);
         return FFX_API_RETURN_ERROR_RUNTIME_ERROR;
     }
     memory_properties(c->physical, &c->memory);
@@ -810,7 +912,7 @@ ffxReturnCode_t create(ffxContext* out, ffxCreateContextDescHeader* header) {
     c->color_format = vk_format(back);
     if (c->color_format == VK_FORMAT_UNDEFINED) {
         say(true, "back buffer surface format %u has no Vulkan format here", desc->backBufferFormat);
-        delete c;
+        free_context(c);
         return FFX_API_RETURN_ERROR_PARAMETER;
     }
     // (with a HUD-less colour, the network's picture is that one, so the previous frame's copy is in its format: AMD's
@@ -1129,12 +1231,15 @@ ffxReturnCode_t generate(Context& c, const ffxDispatchDescFrameGeneration& d) {
 // ---------------------------------------------------------------- the FSR API
 extern "C" {
 
-FFX_API_ENTRY ffxReturnCode_t ffxCreateContext(ffxContext* context, ffxCreateContextDescHeader* desc, const ffxAllocationCallbacks*) {
+FFX_API_ENTRY ffxReturnCode_t ffxCreateContext(ffxContext* context, ffxCreateContextDescHeader* desc, const ffxAllocationCallbacks* memCb) {
     if (!context || !desc) return FFX_API_RETURN_ERROR_PARAMETER;
     *context = nullptr;
-    return create(context, desc);
+    return create(context, desc, memCb);
 }
 
+/// Frees the context and everything it made. It does not wait for the GPU: the caller must have finished (or never
+/// submitted) the command buffers that used it, as with any Vulkan object. The memory goes back to the callbacks it
+/// was created with.
 FFX_API_ENTRY ffxReturnCode_t ffxDestroyContext(ffxContext* context, const ffxAllocationCallbacks*) {
     if (!context || !*context) return FFX_API_RETURN_ERROR_PARAMETER;
     destroy((Context*)*context);
@@ -1146,12 +1251,14 @@ FFX_API_ENTRY ffxReturnCode_t ffxConfigure(ffxContext* context, const ffxConfigu
     if (!desc) return FFX_API_RETURN_ERROR_PARAMETER;
     if (desc->type == FFX_API_CONFIGURE_DESC_TYPE_GLOBALDEBUG) {
         const auto* d = (const ffxConfigureDescGlobalDebug*)desc;
+        std::lock_guard lock(g_message_mu);
         g_message = d->fpMessage, g_message_level = d->debugLevel;
         return FFX_API_RETURN_OK;
     }
     if (desc->type == FFX_API_CONFIGURE_DESC_TYPE_GLOBALDEBUG1) {
         const auto* d = (const ffxApiHeader*)desc;
         struct Debug1 { ffxApiHeader header; ffxApiMessage fpMessage; uint32_t debugLevel; };
+        std::lock_guard lock(g_message_mu);
         g_message = ((const Debug1*)d)->fpMessage, g_message_level = ((const Debug1*)d)->debugLevel;
         return FFX_API_RETURN_OK;
     }
@@ -1183,6 +1290,16 @@ FFX_API_ENTRY ffxReturnCode_t ffxQuery(ffxContext* context, ffxQueryDescHeader* 
         auto* q = (ffxQueryDescGetVersions*)desc;
         if (q->createDescType != FFX_API_CREATE_CONTEXT_DESC_TYPE_FRAMEGENERATION || !q->outputCount) return FFX_API_RETURN_NO_PROVIDER;
         const uint64_t capacity = *q->outputCount;
+        // (as AMD's DLL, traced: a device without what 4.0.2 needs gets no 4.0.2 in the list; this library has nothing
+        // else to offer, so the list is empty. Without a device the provider is listed.)
+        const auto* qdc = (const VkDeviceContext*)q->device;
+        if (qdc && qdc->vkPhysicalDevice) {
+            if (const std::string missing = missing_features(qdc->vkPhysicalDevice); !missing.empty()) {
+                say(true, "this device cannot run FSR Frame Generation 4.0.2: it lacks %s", missing.c_str());
+                *q->outputCount = 0;
+                return FFX_API_RETURN_OK;
+            }
+        }
         *q->outputCount = 1;
         if (capacity >= 1) {
             if (q->versionIds) q->versionIds[0] = VERSION_ID;

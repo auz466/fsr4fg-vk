@@ -74,6 +74,10 @@ def cases():
     for g in (2, 4):
         out['1920x1080_s067_moving_gen%d' % g] = (1920, 1080, 1286, 724, 4, {'TRACE_CAMERA': '0.5', 'TRACE_GEN': str(g)})
     out['1920x1080_s067_moving_gen_none_midstream'] = (1920, 1080, 1286, 724, 5, {'TRACE_CAMERA': '0.5', 'TRACE_GEN_LIST': '1,1,0,1,1'})
+    # (a device without what 4.0.2 needs, asked for 4.0.2 by version override: AMD's create returns NO_PROVIDER, with no
+    # frames; only the API results are compared. Needs the Ryzen's integrated GPU, which has no cooperative matrices)
+    out['igpu_no_coopmat_forced'] = (1280, 720, 1280, 720, 2, {'TRACE_GPU': 'RAPHAEL', 'TRACE_VERSION': '0xf600000001000002',
+                                                                '_NO_CONTEXT': '1'})
     # (other fields of view and planes: the camera matrices use tanf and the planes in float)
     for fov, near, far, nm in (('0.7', '0.05', '500', 'fov07_finite'), ('1.3', '0.3', None, 'fov13_infinite'), ('0.42', '1', '20000', 'fov042_finite'),
                                  ('0.42', '1', '20000', 'fov042_std_finite')):
@@ -163,6 +167,8 @@ def main():
     for name, case in todo.items():
         w, h, rw, rh, frames, cenv = case
         gen = 1   # (AMD's 4.0.2 writes outputs[0] only, whatever is asked for: traced)
+        no_context = cenv.get('_NO_CONTEXT') == '1'
+        cenv = {k: v for k, v in cenv.items() if not k.startswith('_')}
         args = [str(x) for x in (w, h, rw, rh, frames, 0)]
         env = {k: v for k, v in os.environ.items() if not k.startswith('TRACE_')}
         env.update(cenv, TRACE_DUMP_ALL='')
@@ -175,6 +181,7 @@ def main():
             rc, amd_time = run([os.path.join(ROOT, 'harness', 'run_amd.sh'), name] + args,
                                dict(env, FSR4FG_BUILD=build, FSR4FG_RE=os.path.join(suite, 'amd')), ROOT, os.path.join(suite, 'amd', name + '.out'))
             ok, got = results_of(os.path.join(suite, 'amd', name + '.out'), frames)
+            if no_context: ok, rc = not got, 0   # (no frames expected; the API results say the rest)
             if rc or not ok:
                 print('%-40s AMD RUN FAILED (rc %d, frames %s): see %s.out' % (name, rc, got, os.path.join(suite, 'amd', name)))
                 failed.append(name)
@@ -187,13 +194,14 @@ def main():
         rc, port_time = run([os.path.join(build, 'trace'), os.path.join(build, 'amd_fidelityfx_framegeneration_vk.so'), port_dir] + args,
                             env, ROOT, port_dir + '.out')
         ok, got = results_of(port_dir + '.out', frames)
+        if no_context: ok, rc = not got, 0
         mine = images(port_dir, frames, gen) if os.path.exists(os.path.join(port_dir, 'trace.log')) else {}
         bad = sorted(k for k in set(amd['images']) | set(mine) if amd['images'].get(k) != mine.get(k) or mine.get(k) == 'ALL ZERO')
         mine_results = compared(api_results(port_dir)) if os.path.exists(os.path.join(port_dir, 'trace.log')) else []
         if mine_results != compared(amd.get('results', [])):
             bad.append('API results: amd %s, port %s' % (compared(amd.get('results', [])), mine_results))
         made = sum(1 for k in amd['images'] if ' out_made' in k)
-        if rc or not ok or bad or made != frames * gen:
+        if rc or not ok or bad or (made != frames * gen and not no_context):
             failed.append(name)
             harness = [k for k in bad if ' in_' in k]
             print('%-40s FAIL  rc %d, frames %s, %d of %d images differ%s' % (name, rc, got, len(bad), len(amd['images']),

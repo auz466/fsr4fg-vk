@@ -48,7 +48,9 @@
     X(vkCreatePipelineLayout) X(vkCreateComputePipelines) X(vkCreateDescriptorPool) X(vkAllocateDescriptorSets)        \
     X(vkUpdateDescriptorSets) X(vkCmdBindPipeline) X(vkCmdBindDescriptorSets) X(vkCmdDispatch)                         \
     X(vkCmdDispatchIndirect) X(vkCmdCopyImage) X(vkCmdClearColorImage) X(vkCmdFillBuffer) X(vkCmdPushConstants)        \
-    X(vkCreateBufferView) X(vkUnmapMemory) X(vkFlushMappedMemoryRanges)
+    X(vkCreateBufferView) X(vkUnmapMemory) X(vkFlushMappedMemoryRanges) X(vkDestroyImage) X(vkDestroyImageView)        \
+    X(vkDestroySampler) X(vkDestroyShaderModule) X(vkDestroyDescriptorSetLayout) X(vkDestroyPipelineLayout)            \
+    X(vkDestroyPipeline) X(vkDestroyDescriptorPool)
 #define DECL(n) static PFN_##n n;
 INSTANCE_FUNCS(DECL)
 DEVICE_FUNCS(DECL)
@@ -162,10 +164,24 @@ static const void* buffer_bytes(uint64_t buffer, VkDeviceSize offset) {
 
 // ---------------------------------------------------------------- the hooks
 namespace hook {
+// (TRACE_FAIL_AT=n: the provider's n-th object creation fails with VK_ERROR_OUT_OF_DEVICE_MEMORY, to see that it
+// gives up cleanly; g_live: the provider's objects not yet destroyed, logged after its context is destroyed)
+static int g_creations = 0;
+static std::map<uint64_t, int> g_live;   // handle -> 1
+static bool fail_now() {
+    static const int at = getenv("TRACE_FAIL_AT") ? atoi(getenv("TRACE_FAIL_AT")) : 0;
+    if (++g_creations != at) return false;
+    logf("FAILING creation %d on purpose", g_creations);
+    return true;
+}
+template <typename T> static void live(const T& h) { g_live[(uint64_t)h] = 1; }
+template <typename T> static void dead(const T& h) { g_live.erase((uint64_t)h); }
 VkResult VKAPI_CALL CreateBuffer(VkDevice d, const VkBufferCreateInfo* ci, const VkAllocationCallbacks* a, VkBuffer* out) {
+    if (fail_now()) return VK_ERROR_OUT_OF_DEVICE_MEMORY;
     VkBufferCreateInfo c = *ci;
     c.usage |= VK_BUFFER_USAGE_TRANSFER_SRC_BIT;
     VkResult r = vkCreateBuffer(d, &c, a, out);
+    if (r == VK_SUCCESS) live(*out);
     if (r == VK_SUCCESS) {
         g_buffers[H(*out)] = {g_next, ci->size, ci->usage};
         logf("CreateBuffer buf%d size=%llu usage=0x%x", g_next++, (unsigned long long)ci->size, ci->usage);
@@ -173,10 +189,12 @@ VkResult VKAPI_CALL CreateBuffer(VkDevice d, const VkBufferCreateInfo* ci, const
     return r;
 }
 VkResult VKAPI_CALL CreateImage(VkDevice d, const VkImageCreateInfo* ci, const VkAllocationCallbacks* a, VkImage* out) {
+    if (fail_now()) return VK_ERROR_OUT_OF_DEVICE_MEMORY;
     VkImageCreateInfo c = *ci;
     c.usage |= VK_IMAGE_USAGE_TRANSFER_SRC_BIT;
     if (c.format == VK_FORMAT_R64_UINT) c.flags |= VK_IMAGE_CREATE_MUTABLE_FORMAT_BIT;   // (sampled as R32G32_UINT: tools/spv_fix.py)
     VkResult r = vkCreateImage(d, &c, a, out);
+    if (r == VK_SUCCESS) live(*out);
     if (r == VK_SUCCESS) {
         g_images[H(*out)] = {g_next, ci->format, ci->extent, ci->mipLevels, ci->usage, ci->initialLayout};
         logf("CreateImage img%d type=%d format=%d extent=%ux%ux%u mips=%u layers=%u usage=0x%x flags=0x%x", g_next++,
@@ -186,7 +204,9 @@ VkResult VKAPI_CALL CreateImage(VkDevice d, const VkImageCreateInfo* ci, const V
     return r;
 }
 VkResult VKAPI_CALL CreateImageView(VkDevice d, const VkImageViewCreateInfo* ci, const VkAllocationCallbacks* a, VkImageView* out) {
+    if (fail_now()) return VK_ERROR_OUT_OF_DEVICE_MEMORY;
     VkResult r = vkCreateImageView(d, ci, a, out);
+    if (r == VK_SUCCESS) live(*out);
     if (r == VK_SUCCESS) {
         g_views[H(*out)] = {g_next, H(ci->image), ci->subresourceRange.baseMipLevel, *ci};
         auto im = g_images.find(H(ci->image));
@@ -197,7 +217,9 @@ VkResult VKAPI_CALL CreateImageView(VkDevice d, const VkImageViewCreateInfo* ci,
     return r;
 }
 VkResult VKAPI_CALL CreateSampler(VkDevice d, const VkSamplerCreateInfo* ci, const VkAllocationCallbacks* a, VkSampler* out) {
+    if (fail_now()) return VK_ERROR_OUT_OF_DEVICE_MEMORY;
     VkResult r = vkCreateSampler(d, ci, a, out);
+    if (r == VK_SUCCESS) live(*out);
     if (r == VK_SUCCESS && !g_samplers.count(H(*out))) {
         g_samplers[H(*out)] = g_next;
         logf("CreateSampler smp%d mag=%d min=%d mip=%d addr=%d,%d,%d maxLod=%g", g_next++, ci->magFilter, ci->minFilter,
@@ -206,6 +228,7 @@ VkResult VKAPI_CALL CreateSampler(VkDevice d, const VkSamplerCreateInfo* ci, con
     return r;
 }
 VkResult VKAPI_CALL CreateShaderModule(VkDevice d, const VkShaderModuleCreateInfo* ci, const VkAllocationCallbacks* a, VkShaderModule* out) {
+    if (fail_now()) return VK_ERROR_OUT_OF_DEVICE_MEMORY;
     char name[64];
     snprintf(name, sizeof name, "mod_%04d.spv", g_next);
     dump_file(name, ci->pCode, ci->codeSize);
@@ -227,6 +250,7 @@ VkResult VKAPI_CALL CreateShaderModule(VkDevice d, const VkShaderModuleCreateInf
         }
     }
     VkResult r = vkCreateShaderModule(d, &c, a, out);
+    if (r == VK_SUCCESS) live(*out);
     logf("CreateShaderModule mod%d size=%llu fnv=%016llx%s result=%d", g_next, (unsigned long long)ci->codeSize, (unsigned long long)h,
          patched.empty() ? "" : " PATCHED", r);
     if (r == VK_SUCCESS) g_modules[H(*out)] = g_next;
@@ -234,7 +258,9 @@ VkResult VKAPI_CALL CreateShaderModule(VkDevice d, const VkShaderModuleCreateInf
     return r;
 }
 VkResult VKAPI_CALL CreateDescriptorSetLayout(VkDevice d, const VkDescriptorSetLayoutCreateInfo* ci, const VkAllocationCallbacks* a, VkDescriptorSetLayout* out) {
+    if (fail_now()) return VK_ERROR_OUT_OF_DEVICE_MEMORY;
     VkResult r = vkCreateDescriptorSetLayout(d, ci, a, out);
+    if (r == VK_SUCCESS) live(*out);
     std::string s;
     char b[64];
     for (uint32_t i = 0; i < ci->bindingCount; i++) {
@@ -246,7 +272,9 @@ VkResult VKAPI_CALL CreateDescriptorSetLayout(VkDevice d, const VkDescriptorSetL
     return r;
 }
 VkResult VKAPI_CALL CreatePipelineLayout(VkDevice d, const VkPipelineLayoutCreateInfo* ci, const VkAllocationCallbacks* a, VkPipelineLayout* out) {
+    if (fail_now()) return VK_ERROR_OUT_OF_DEVICE_MEMORY;
     VkResult r = vkCreatePipelineLayout(d, ci, a, out);
+    if (r == VK_SUCCESS) live(*out);
     std::string s;
     char b[64];
     for (uint32_t i = 0; i < ci->setLayoutCount; i++) snprintf(b, sizeof b, " dsl%d", g_setlayouts[H(ci->pSetLayouts[i])]), s += b;
@@ -257,7 +285,9 @@ VkResult VKAPI_CALL CreatePipelineLayout(VkDevice d, const VkPipelineLayoutCreat
     return r;
 }
 VkResult VKAPI_CALL CreateComputePipelines(VkDevice d, VkPipelineCache cache, uint32_t n, const VkComputePipelineCreateInfo* ci, const VkAllocationCallbacks* a, VkPipeline* out) {
+    if (fail_now()) return VK_ERROR_OUT_OF_DEVICE_MEMORY;
     VkResult r = vkCreateComputePipelines(d, cache, n, ci, a, out);
+    if (r == VK_SUCCESS) for (uint32_t i = 0; i < n; i++) live(out[i]);
     for (uint32_t i = 0; i < n; i++) {
         std::string chain;
         char b[64];
@@ -275,7 +305,9 @@ VkResult VKAPI_CALL CreateComputePipelines(VkDevice d, VkPipelineCache cache, ui
     return r;
 }
 VkResult VKAPI_CALL AllocateMemory(VkDevice d, const VkMemoryAllocateInfo* ai, const VkAllocationCallbacks* a, VkDeviceMemory* out) {
+    if (fail_now()) return VK_ERROR_OUT_OF_DEVICE_MEMORY;
     VkResult r = vkAllocateMemory(d, ai, a, out);
+    if (r == VK_SUCCESS) live(*out);
     if (r == VK_SUCCESS) g_memories[H(*out)] = g_next;
     logf("AllocateMemory mem%d size=%llu type=%u result=%d", g_next++, (unsigned long long)ai->allocationSize, ai->memoryTypeIndex, r);
     return r;
@@ -295,6 +327,7 @@ VkResult VKAPI_CALL BindBufferMemory(VkDevice d, VkBuffer b, VkDeviceMemory m, V
     return vkBindBufferMemory(d, b, m, off);
 }
 VkResult VKAPI_CALL AllocateDescriptorSets(VkDevice d, const VkDescriptorSetAllocateInfo* ai, VkDescriptorSet* out) {
+    if (fail_now()) return VK_ERROR_OUT_OF_DEVICE_MEMORY;
     VkResult r = vkAllocateDescriptorSets(d, ai, out);
     if (r == VK_SUCCESS)
         for (uint32_t i = 0; i < ai->descriptorSetCount; i++) {
@@ -489,6 +522,23 @@ VkResult VKAPI_CALL SetDebugUtilsObjectNameEXT(VkDevice, const VkDebugUtilsObjec
 void VKAPI_CALL CmdBeginDebugUtilsLabelEXT(VkCommandBuffer, const VkDebugUtilsLabelEXT* l) { logf("LABEL begin %s", l->pLabelName); }
 void VKAPI_CALL CmdEndDebugUtilsLabelEXT(VkCommandBuffer) { logf("LABEL end"); }
 
+void VKAPI_CALL DestroyBuffer(VkDevice d, VkBuffer h, const VkAllocationCallbacks* a) { dead(h), vkDestroyBuffer(d, h, a); }
+void VKAPI_CALL DestroyImage(VkDevice d, VkImage h, const VkAllocationCallbacks* a) { dead(h), vkDestroyImage(d, h, a); }
+void VKAPI_CALL DestroyImageView(VkDevice d, VkImageView h, const VkAllocationCallbacks* a) { dead(h), vkDestroyImageView(d, h, a); }
+void VKAPI_CALL DestroySampler(VkDevice d, VkSampler h, const VkAllocationCallbacks* a) { dead(h), vkDestroySampler(d, h, a); }
+void VKAPI_CALL DestroyShaderModule(VkDevice d, VkShaderModule h, const VkAllocationCallbacks* a) { dead(h), vkDestroyShaderModule(d, h, a); }
+void VKAPI_CALL DestroyDescriptorSetLayout(VkDevice d, VkDescriptorSetLayout h, const VkAllocationCallbacks* a) { dead(h), vkDestroyDescriptorSetLayout(d, h, a); }
+void VKAPI_CALL DestroyPipelineLayout(VkDevice d, VkPipelineLayout h, const VkAllocationCallbacks* a) { dead(h), vkDestroyPipelineLayout(d, h, a); }
+void VKAPI_CALL DestroyPipeline(VkDevice d, VkPipeline h, const VkAllocationCallbacks* a) { dead(h), vkDestroyPipeline(d, h, a); }
+void VKAPI_CALL FreeMemory(VkDevice d, VkDeviceMemory h, const VkAllocationCallbacks* a) { dead(h), vkFreeMemory(d, h, a); }
+VkResult VKAPI_CALL CreateDescriptorPool(VkDevice d, const VkDescriptorPoolCreateInfo* ci, const VkAllocationCallbacks* a, VkDescriptorPool* out) {
+    if (fail_now()) return VK_ERROR_OUT_OF_DEVICE_MEMORY;
+    VkResult r = vkCreateDescriptorPool(d, ci, a, out);
+    if (r == VK_SUCCESS) live(*out);
+    return r;
+}
+void VKAPI_CALL DestroyDescriptorPool(VkDevice d, VkDescriptorPool h, const VkAllocationCallbacks* a) { dead(h), vkDestroyDescriptorPool(d, h, a); }
+
 PFN_vkVoidFunction VKAPI_CALL GetDeviceProcAddr(VkDevice d, const char* name) {
 #define HOOK(n) \
     if (!strcmp(name, "vk" #n)) return (PFN_vkVoidFunction)n;
@@ -498,6 +548,9 @@ PFN_vkVoidFunction VKAPI_CALL GetDeviceProcAddr(VkDevice d, const char* name) {
     HOOK(CmdBindPipeline) HOOK(CmdBindDescriptorSets) HOOK(CmdDispatch) HOOK(CmdDispatchIndirect) HOOK(CmdPushConstants)
     HOOK(CmdCopyBuffer) HOOK(CmdCopyBufferToImage) HOOK(CmdCopyImage) HOOK(CmdClearColorImage) HOOK(CmdFillBuffer)
     HOOK(CmdPipelineBarrier) HOOK(SetDebugUtilsObjectNameEXT) HOOK(CmdBeginDebugUtilsLabelEXT) HOOK(CmdEndDebugUtilsLabelEXT)
+    HOOK(DestroyBuffer) HOOK(DestroyImage) HOOK(DestroyImageView) HOOK(DestroySampler) HOOK(DestroyShaderModule)
+    HOOK(DestroyDescriptorSetLayout) HOOK(DestroyPipelineLayout) HOOK(DestroyPipeline) HOOK(FreeMemory)
+    HOOK(CreateDescriptorPool) HOOK(DestroyDescriptorPool)
 #undef HOOK
     PFN_vkVoidFunction f = vkGetDeviceProcAddr(d, name);
     logf("GetDeviceProcAddr %s -> %s (not traced)", name, f ? "real" : "NULL");
@@ -863,6 +916,11 @@ static void draw_hud(std::vector<uint8_t>& rgba, uint32_t w, uint32_t h, int fra
         }
 }
 
+// (TRACE_ALLOC: allocation callbacks for create and destroy that count what they hand out and take back)
+static int g_allocs = 0, g_frees = 0;
+static void* count_alloc(void*, size_t size) { g_allocs++; return malloc(size); }
+static void count_free(void*, void* mem) { if (mem) g_frees++; free(mem); }
+
 static void message(uint32_t type, const wchar_t* m) {
     std::string s;
     for (; m && *m; m++) s += (char)*m;
@@ -910,6 +968,12 @@ int main(int argc, char** argv) {
         vkGetPhysicalDeviceProperties(devs[i], &p);
         if (p.deviceType == VK_PHYSICAL_DEVICE_TYPE_DISCRETE_GPU) { g_phys = devs[i]; break; }
     }
+    if (const char* want = getenv("TRACE_GPU"))   // (a device whose name contains this, instead of the first discrete one)
+        for (uint32_t i = 0; i < n; i++) {
+            VkPhysicalDeviceProperties p;
+            vkGetPhysicalDeviceProperties(devs[i], &p);
+            if (strstr(p.deviceName, want)) { g_phys = devs[i]; break; }
+        }
     VkPhysicalDeviceProperties props;
     vkGetPhysicalDeviceProperties(g_phys, &props);
     logf("GPU %s vendor=0x%x device=0x%x driver=0x%x api=0x%x", props.deviceName, props.vendorID, props.deviceID, props.driverVersion, props.apiVersion);
@@ -1059,10 +1123,16 @@ int main(int argc, char** argv) {
     memory_v2(0), memory_v2(FFX_FRAMEGENERATION_FLAG_DRAW_DEBUG_VIEW);
     ffxContext ctx = nullptr;
     logf("=== create context display=%ux%u render=%ux%u flags=0x%x format=%d", W, Hh, RW, RH, cc.flags, color_format);
-    r = create(&ctx, &cc.header, nullptr);
+    ffxAllocationCallbacks counting{nullptr, count_alloc, count_free};
+    const ffxAllocationCallbacks* callbacks = getenv("TRACE_ALLOC") ? &counting : nullptr;
+    r = create(&ctx, &cc.header, callbacks);
     logf("=== create context -> %u ctx=%p", r, ctx);
     fprintf(stderr, "create context -> %u\n", r);
-    if (r != FFX_API_RETURN_OK || !ctx) return 2;
+    if (r != FFX_API_RETURN_OK || !ctx) {
+        logf("LIVE %zu of the provider's objects left after the failed create", hook::g_live.size());
+        fprintf(stderr, "provider objects left after the failed create: %zu\n", hook::g_live.size());
+        return 2;
+    }
     auto memory_v1 = [&](const char* when) {
         FfxApiEffectMemoryUsage mu{};
         ffxQueryDescFrameGenerationGetGPUMemoryUsage q1{};
@@ -1222,8 +1292,14 @@ int main(int argc, char** argv) {
     }
     memory_v1("after the frames");
     vkDeviceWaitIdle(g_device);
-    r = destroy(&ctx, nullptr);
+    r = destroy(&ctx, callbacks);
     logf("=== destroy -> %u", r);
+    logf("LIVE %zu of the provider's objects left after destroy", hook::g_live.size());
+    fprintf(stderr, "provider objects left after destroy: %zu\n", hook::g_live.size());
+    if (callbacks) {
+        logf("ALLOC allocations=%d frees=%d", g_allocs, g_frees);
+        fprintf(stderr, "allocation callbacks: %d allocations, %d frees\n", g_allocs, g_frees);
+    }
     fprintf(stderr, "done: %d dispatches traced\n", g_dispatch);
     fclose(g_log);
     return 0;
