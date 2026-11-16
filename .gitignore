@@ -11,3 +11,5 @@
 /local.env
 __pycache__/
 *.pyc
+/build-so/
+/dist/
