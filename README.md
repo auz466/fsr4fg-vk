@@ -23,4 +23,5 @@ use and do not redistribute it.
 
 ## Notices
 
-See `THIRD_PARTY_NOTICES.md`. No licence has been chosen for this repository's own code yet.
+This repository's own code is MIT licensed (`LICENSE`). AMD's headers and the parts adapted from AMD's SDK keep AMD's
+MIT notice (`THIRD_PARTY_NOTICES.md`). AMD's DLL and what is extracted from it are AMD's and are not covered.
