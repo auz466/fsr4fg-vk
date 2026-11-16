@@ -51,8 +51,8 @@ into `build-so/dll/`, checks its SHA-256 (`d002dabff8c5e71eaa715fc99438cd4dc8123
 data (never runs it), and embeds AMD's shaders and weights in the library. Later runs reuse it.
 
 Options: `./make-so.sh /path/to/amd_fidelityfx_framegeneration_vk.dll` uses your own copy, `--download` refetches, and a
-second argument is the output directory. The built `.so` embeds AMD's shaders and weights: keep it for your own use and
-do not redistribute it. `./build.sh [dll]` is the developer build, which also builds the test harness (`build/trace`, and
+second argument is the output directory. The script also copies `THIRD_PARTY_NOTICES.md` (AMD's MIT notice) beside the `.so`.
+`./build.sh [dll]` is the developer build, which also builds the test harness (`build/trace`, and
 `build/wine/trace.exe` with mingw-w64).
 
 ## Environment variables
@@ -75,5 +75,8 @@ See `STANDALONE_PLAN.md` for how it was made and its pitfalls, and `THIRD_PARTY_
 
 ## Licence
 
-MIT, see `LICENSE` (this repository's own code). AMD's headers in `third_party/` and the data a build takes from AMD's
-DLL stay under AMD's MIT licence; see `THIRD_PARTY_NOTICES.md`.
+MIT, see `LICENSE` (this repository's own code). AMD's headers in `third_party/` and the shaders and weights a build
+takes from AMD's DLL are AMD's, under AMD's MIT licence: the FidelityFX SDK's
+[`docs/license.md`](https://github.com/GPUOpen-LibrariesAndSDKs/FidelityFX-SDK/blob/main/docs/license.md) lists
+`amd_fidelityfx_framegeneration_vk.dll` among the files under it. A built `.so` embeds them, so anyone who passes one on
+must keep AMD's notice with it (`THIRD_PARTY_NOTICES.md`). This repository itself ships no binary.

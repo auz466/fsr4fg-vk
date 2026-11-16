@@ -3,7 +3,7 @@
 #
 # Builds amd_fidelityfx_framegeneration_vk.so from YOUR OWN copy of AMD's DLL (FSR SDK 2.4.0, the Vulkan frame
 # generation provider). The DLL is read as data only (never run): its shaders and model weights are extracted at build
-# time and embedded in the .so. That is why this repository ships no binary: you build your own, for your own use.
+# time and embedded in the .so. This repository ships no binary: you build your own.
 #
 #   ./make-so.sh                          downloads AMD's DLL from the FidelityFX SDK v2.4.0 tag into build-so/dll/ (36 MB)
 #   ./make-so.sh /path/to/the.dll         uses your own copy instead
@@ -74,4 +74,5 @@ mkdir -p "$OUT"
 cp "$BUILD/$NAME.so" "$OUT/$NAME.so"
 echo
 echo "Built: $OUT/$NAME.so"
-echo "This file embeds AMD's shaders and weights. Keep it for your own use; do not redistribute it."
+cp "$HERE/THIRD_PARTY_NOTICES.md" "$OUT/THIRD_PARTY_NOTICES.md"
+echo "This file embeds AMD's shaders and weights (AMD's MIT licence); pass it on only with $OUT/THIRD_PARTY_NOTICES.md."

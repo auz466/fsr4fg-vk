@@ -5,6 +5,9 @@ swapchain).
 
 ## AMD FidelityFX SDK 2.4.0 (MIT)
 
+- `amd_fidelityfx_framegeneration_vk.dll`: `tools/setup.py` takes its shaders and model weights at build time and the
+  `.so` embeds them. AMD's `docs/license.md` lists this DLL under its MIT section. A built `.so` must be accompanied by
+  this notice.
 - `third_party/amd-fidelityfx-api/`: AMD's FidelityFX API headers, unmodified. Their notice is beside them.
 - `src/fsr4fg.cpp`, `fsr3_memory_usage_v2`: adapted from AMD's FidelityFX SDK 2.4.0,
   `Kits/FidelityFX/framegeneration/fsr3/internal/ffx_frameinterpolation.cpp` (`ffxFrameInterpolationGetGpuMemoryUsage`,
